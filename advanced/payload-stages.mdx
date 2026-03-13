@@ -1,0 +1,652 @@
+---
+title: Payload Stages
+description: Detailed analysis of each payload stage in the Kamakiri exploit chain
+icon: 'layer-group'
+---
+
+## Overview
+
+Kamakiri's exploit chain consists of multiple stages, each building upon the previous to gain progressively more control. This page provides a deep dive into each stage's implementation.
+
+## Stage 1: Initial Code Execution
+
+### Build Configuration
+
+Stage 1 is built with strict size constraints:
+
+```bash
+# Must fit within 0xA00 (2560) bytes
+# Located in brom-payload/stage1/
+arm-none-eabi-gcc -mthumb -mcpu=cortex-a9 -Os -nostdlib \
+  -o stage1.elf stage1.c common.c brom_common.c \
+  -T linker.ld
+```
+
+### Entry Point
+
+Stage 1 begins execution at the address where it was loaded by the bootrom exploit:
+
+```c
+// brom-payload/stage1.c:14
+int main() {
+    print("Entered 1ST stage payload\n");
+    print("Copyright xyz, k4y0z 2019\n");
+    
+    // Critical: prevent USB timeout
+    send_usb_response(0,0,1);
+    
+    // Signal that we're ready
+    send_dword(0xA1A2A3A4);
+    
+    // Enter command loop
+    while (1) {
+        // ... handle commands
+    }
+}
+```
+
+<Warning>
+The `send_usb_response(0,0,1)` call is critical. Without it, the bootrom USB stack will timeout and crash the device.
+</Warning>
+
+### Command Protocol
+
+<Steps>
+
+<Step title="Magic Number Check">
+Every command must begin with the magic number `0xf00dd00d`:
+
+```c
+// brom-payload/stage1.c:27-32
+while (1) {
+    uint32_t magic = recv_dword();
+    if (magic != 0xf00dd00d) {
+        print("Protocol error\n");
+        break;
+    }
+    uint32_t cmd = recv_dword();
+```
+
+If the magic is incorrect, stage 1 exits the command loop and hangs.
+</Step>
+
+<Step title="Command Dispatch">
+Commands are dispatched via switch statement:
+
+| Command | Name | Parameters | Description |
+|---------|------|------------|-------------|
+| `0x4000` | Write Memory | address, size, data | Write arbitrary data to memory |
+| `0x4001` | Jump | address | Execute code at address |
+| `0x3000` | Reboot | none | Hardware reset |
+| `0x3001` | Kick Watchdog | none | Reset watchdog timer |
+
+</Step>
+
+<Step title="Write Memory (0x4000)">
+```c
+// brom-payload/stage1.c:35-48
+case 0x4000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    print("Write\n");
+    
+    if(recv_data(address, size, 0) == 0) {
+        print("OK\n");
+        send_dword(0xD0D0D0D0);  // Success
+    } else {
+        send_dword(0xF0F0F0F0);  // Failure
+        print("Read fail\n");
+    }
+    break;
+}
+```
+
+The `recv_data()` function is a bootrom function that receives data over USB and writes it directly to the specified address.
+</Step>
+
+<Step title="Jump (0x4001)">
+```c
+// brom-payload/stage1.c:50-56
+case 0x4001: {
+    void (*jump_address)(void) = (void*) recv_dword();
+    print("Jump\n");
+    jump_address();  // Direct function pointer call
+    break;
+}
+```
+
+This casts the received address to a function pointer and calls it. Execution never returns.
+</Step>
+
+</Steps>
+
+### Bootrom Function Integration
+
+Stage 1 leverages existing bootrom functions for USB communication:
+
+```c
+// brom-payload/brom_common.c
+void (*send_usb_response)(int, int, int) = (void*)0x55bb;
+int (*send_dword)() = (void*)0xBE09;
+int (*recv_dword)() = (void*)0xBDD5;
+int (*send_data)() = (void*)0xBED1;
+int (*recv_data)() = (void*)0xBE4B;
+```
+
+<Note>
+These addresses are specific to the MediaTek bootrom version. Different SoC versions may require different addresses.
+</Note>
+
+### Python Client Implementation
+
+```python
+# modules/load_payload.py:104-121
+def send_stage2(dev, stage2_data):
+    # magic
+    dev.dev.write(struct.pack('>I', 0xf00dd00d))
+    # cmd
+    dev.dev.write(struct.pack('>I', 0x4000))
+    # address to write
+    dev.dev.write(struct.pack('>I', 0x201000))
+    # length
+    dev.dev.write(struct.pack('>I', len(stage2_data)))
+    # data
+    dev.dev.write(stage2_data)
+    
+    code = dev.dev.read(4)
+    if code != b"\xd0\xd0\xd0\xd0":
+        raise RuntimeError("device failure")
+```
+
+---
+
+## Stage 2: eMMC Controller
+
+### Initialization
+
+Stage 2 is significantly larger (~40KB) and includes full eMMC driver support:
+
+```c
+// brom-payload/stage2.c:4-14
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+    
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;  // 0x40FF8080
+    
+    mmc_init(&host);
+    
+    command_loop(&host);
+}
+```
+
+### MMC Initialization Sequence
+
+The `mmc_init()` function performs a complete eMMC initialization:
+
+```c
+// brom-payload/drivers/mmc.c:998-1039
+int mmc_init(struct msdc_host *host) {
+    host->blksz = 0x200;
+    
+    // Configure MSDC controller for PIO mode
+    sdr_set_bits(MSDC_CFG, MSDC_CFG_PIO);
+    sdr_write32(MSDC_CFG, sdr_read32(MSDC_CFG) | 0x1000);
+    
+    // Reset card
+    mmc_go_idle(host);
+    
+    // Query operating conditions
+    uint32_t ocr = 0;
+    mmc_send_op_cond(host, 0, &ocr);
+    
+    // Select voltage
+    ocr = mmc_select_voltage(host, ocr);
+    ocr |= 1 << 30;  // Set high capacity support
+    
+    uint32_t rocr = 0;
+    mmc_send_op_cond(host, ocr, &rocr);
+    
+    // Get card identification
+    uint32_t cid[4] = { 0 };
+    mmc_all_send_cid(host, cid);
+    
+    // Derive RPMB key from CID
+    uint32_t cid_be[4];
+    for (int i = 0; i < 4; ++i)
+        cid_be[i] = __builtin_bswap32(cid[i]);
+    derive_rpmb_key((void*)cid_be);
+    
+    // Set relative address and select card
+    mmc_set_relative_addr(host, 1);
+    mmc_select_card(host, 1);
+    
+    return 0;
+}
+```
+
+<Note>
+The CID (Card Identification) is used to derive the RPMB (Replay Protected Memory Block) key, which is unique per device.
+</Note>
+
+### Enhanced Command Loop
+
+Stage 2's command loop is much more sophisticated:
+
+```c
+// brom-payload/payload_common.c:43-194
+void command_loop(struct msdc_host *host) {
+    char buf[0x200] = { 0 };
+    
+    printf("Entering command loop\n");
+    send_dword(0xB1B2B3B4);  // Stage 2 ready signal
+    
+    while (1) {
+        memset(buf, 0, sizeof(buf));
+        uint32_t magic = recv_dword();
+        if (magic != 0xf00dd00d) {
+            printf("Protocol error\n");
+            printf("Magic received = 0x%08X\n", magic);
+            break;
+        }
+        uint32_t cmd = recv_dword();
+        switch (cmd) {
+            // ... handle commands
+        }
+    }
+}
+```
+
+### Stage 2 Commands
+
+<AccordionGroup>
+
+<Accordion title="0x1000 - Read Block" icon="book-open">
+```c
+// brom-payload/payload_common.c:61-70
+case 0x1000: {
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    memset(buf, 0, sizeof(buf));
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, sizeof(buf));  // Send 512 bytes
+    }
+    break;
+}
+```
+
+Reads a single 512-byte block from the currently selected eMMC partition.
+</Accordion>
+
+<Accordion title="0x1001 - Write Block" icon="pen">
+```c
+// brom-payload/payload_common.c:72-83
+case 0x1001: {
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    memset(buf, 0, sizeof(buf));
+    recv_data(buf, 0x200, 0);
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        printf("OK\n");
+        send_dword(0xD0D0D0D0);
+    }
+    break;
+}
+```
+
+Writes a single 512-byte block to the currently selected eMMC partition.
+</Accordion>
+
+<Accordion title="0x1002 - Switch Partition" icon="arrows-turn-to-dots">
+```c
+// brom-payload/payload_common.c:85-92
+case 0x1002: {
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    ret = mmc_set_part(host, part);
+    printf("0x%08X\n", ret);
+    mdelay(500);  // Allow partition switch to settle
+    break;
+}
+```
+
+Partition numbers:
+- `0` - User data partition
+- `1` - Boot0 partition
+- `2` - Boot1 partition
+- `3` - RPMB partition
+</Accordion>
+
+<Accordion title="0x2000 - Read RPMB" icon="shield">
+```c
+// brom-payload/payload_common.c:93-98
+case 0x2000: {
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);  // Send 256 bytes
+    break;
+}
+```
+
+Reads from the RPMB (Replay Protected Memory Block) partition. RPMB operations require HMAC-SHA256 authentication.
+</Accordion>
+
+<Accordion title="0x2001 - Write RPMB" icon="shield-check">
+```c
+// brom-payload/payload_common.c:99-104
+case 0x2001: {
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+Writes to RPMB partition. This is used to zero out the RPMB to enable firmware downgrade.
+</Accordion>
+
+<Accordion title="0x5000 - Read Memory" icon="memory">
+```c
+// brom-payload/payload_common.c:105-111
+case 0x5000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+```
+
+Reads arbitrary memory. Useful for dumping bootrom or SRAM contents.
+</Accordion>
+
+<Accordion title="0x7000 - Read IDME" icon="id-card">
+```c
+// brom-payload/payload_common.c:112-172
+case 0x7000: {
+    char idme_buf[0x400] = { 0 };
+    char field_name[16] = { 0 };
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    
+    // Switch to boot1 partition where IDME is stored
+    mmc_set_part(host, 2);
+    
+    // Search for field in IDME
+    uint32_t block = 0;
+    void *type_offset = 0;
+    while (!(type_offset = memmem(idme_buf, 0x400, &field_name, 16)) 
+           && block < 0x2000) {
+        mmc_read(host, block++, buf);
+        
+        // Verify IDME signature on first block
+        if (block == 1 && memcmp(buf, "beefdeed", 8)) {
+            printf("IDME invalid!\n");
+            result = 0xbeefdeed;
+            break;
+        }
+        
+        // Sliding window search
+        memcpy(idme_buf, idme_buf + 0x200, 0x200);
+        memcpy(idme_buf + 0x200, buf, 0x200);
+    }
+    
+    if (type_offset) {
+        uint32_t len = *(uint32_t*)(type_offset + 16);
+        type_offset += 16 + 12;
+        send_dword(len);
+        send_data(type_offset, len);
+    }
+    break;
+}
+```
+
+Reads fields from Amazon's IDME (ID Me) partition, which stores device-specific information like serial numbers and device type.
+</Accordion>
+
+</AccordionGroup>
+
+### RPMB Key Derivation
+
+The RPMB key is derived from the eMMC CID using hardware crypto (SEJ engine):
+
+```c
+// brom-payload/drivers/mmc.c:971-996
+static void derive_rpmb_key(uint8_t *in) {
+    printf("in:\n");
+    hex_dump(in, 16);
+    
+    // Expand 16 bytes to 32 bytes
+    uint8_t expand[32] = { 0 };
+    for (int i = 0; i < 32; ++i) {
+        expand[i] = in[i % 16];
+    }
+    
+    // Encrypt with SEJ hardware engine
+    sej_encrypt(expand, 32, expand);
+    
+    // Byteswap for proper endianness
+    byteswap(expand, 32);
+    
+    // Store as global RPMB key
+    memcpy(rpmb_key, expand, 32);
+}
+```
+
+<Warning>
+The SEJ (Secure Engine Janus) is a hardware crypto engine. The initialization values at `brom-payload/drivers/mmc.c:808-841` are device-specific magic numbers.
+</Warning>
+
+---
+
+## Microloader
+
+### Purpose and Placement
+
+The microloader is a tiny (~200 byte) loader injected into the boot partition header:
+
+```
+Original Boot Image:
+┌────────────────┬──────────────────┬─────────────┐
+│  Android Hdr   │   Kernel         │  Ramdisk    │
+│  0x400 bytes   │   ...            │  ...        │
+└────────────────┴──────────────────┴─────────────┘
+
+With Microloader:
+┌────────────────┬──────────────────┬─────────────┐
+│  Microloader   │   Kernel         │  Ramdisk    │
+│  0x400 bytes   │   ...            │  ...        │
+└────────────────┴──────────────────┴─────────────┘
+              ↓
+      ┌───────────────┐
+      │ Android Hdr   │
+      │ moved to      │
+      │ +0x400        │
+      └───────────────┘
+```
+
+The original Android boot header is moved to offset 0x400, and the microloader replaces the first 0x400 bytes.
+
+### Microloader Code
+
+```c
+// microloader/main.c:31-58
+int main() {
+    puts("microloader");
+    
+    // Get device structure (provided by LK)
+    struct device_t *dev = (void*)get_device();
+    
+    uint32_t *dst = (void*)PAYLOAD_DST;  // 0x41E00200
+    
+    // Read LK payload from boot0 partition
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, 
+                          PAYLOAD_SIZE, BOOT0_PART);
+    
+    // Verify payload signature (ARM instruction)
+    if(*dst != 0xe3a0d442) {  // mov sp, #...
+        puts("Try backup");
+        // Try backup location if primary is corrupted
+        ret = dev->read(dev, BACKUP_SRC, dst, 
+                       PAYLOAD_SIZE, BOOT0_PART);
+    }
+    
+    // Clean cache for execute
+    cache_clean(dst, PAYLOAD_SIZE);
+    
+    // Jump to the LK payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();
+    
+    // Should never reach here
+    while (1) {}
+}
+```
+
+### Memory Corruption Issue
+
+The microloader overwrites part of LK's memory space. The LK payload must restore this:
+
+```c
+// lk-payload/main.c:116-121
+// Restore the 0x41E00200-0x41E01200 range
+// This was overwritten by microloader
+dev->read(dev, g_lk * 0x200 + 0x200 + 0x200, 
+          (char*)LK_BASE + 0x200, 0x1000, USER_PART);
+```
+
+---
+
+## LK Payload
+
+### Execution Context
+
+The LK payload runs in the Little Kernel bootloader after being loaded by the microloader. At this point:
+
+- MMU is enabled
+- Cache is active
+- Full device drivers available
+- Can read/write all partitions
+- Can modify LK behavior
+
+### Boot Flow Modification
+
+The payload reads the MISC partition to determine boot behavior:
+
+```c
+// lk-payload/main.c:141-190
+if(g_misc) {
+    // Read boot flags from MISC partition
+    dev->read(dev, g_misc * 0x200, bootloader_msg, 0x20, USER_PART);
+    printf("bootloader_msg: %s\n", bootloader_msg);
+    
+    // Temporary fastboot flag
+    if(strncmp(bootloader_msg, "boot-amonet", 11) == 0) {
+        fastboot = 1;
+        memset(bootloader_msg, 0, 0x10);
+        dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+    }
+    
+    // Permanent fastboot flag (cleared only in recovery)
+    else if(strncmp(bootloader_msg, "FASTBOOT_PLEASE", 15) == 0) {
+        if(*g_boot_mode == 2) {  // Recovery mode
+            memset(bootloader_msg, 0, 0x10);
+            dev->write(dev, bootloader_msg, g_misc * 0x200, 
+                      0x10, USER_PART);
+        } else {
+            fastboot = 1;
+        }
+    }
+    
+    // Recovery flag
+    else if(strncmp(bootloader_msg, "boot-recovery", 13) == 0) {
+        *g_boot_mode = 2;
+        memset(bootloader_msg, 0, 0x10);
+        dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+    }
+    
+    // Force normal boot flag
+    else if(strncmp(bootloader_msg, "boot-system", 11) == 0) {
+        boot_system = 1;
+        memset(bootloader_msg, 0, 0x10);
+        dev->write(dev, bootloader_msg, g_misc * 0x200, 0x10, USER_PART);
+    }
+}
+```
+
+### Security Patches
+
+The payload applies ARM thumb instruction patches to bypass security checks:
+
+```c
+// lk-payload/main.c:211-225
+uint16_t *patch;
+
+// Patch 1: Device unlock check
+patch = (void*)0x41E01D34;
+*patch++ = 0x2001; // movs r0, #1   (return true)
+*patch = 0x4770;   // bx lr         (return)
+
+// Patch 2: Amazon verify_unlock  
+patch = (void*)0x41E01EA0;
+*patch++ = 0x2000; // movs r0, #0   (return success)
+*patch = 0x4770;   // bx lr         (return)
+
+// Patch 3: Hook read function
+uint32_t *patch32;
+original_read = (void*)dev->read;
+patch32 = (void*)&dev->read;
+*patch32 = (uint32_t)read_func;  // Replace with our hook
+```
+
+<Note>
+These patches are ARM Thumb-2 instructions:
+- `0x2001` = `movs r0, #1` - Move immediate 1 to register r0
+- `0x4770` = `bx lr` - Branch to link register (return)
+</Note>
+
+### Boot Image Demangling
+
+The read hook removes the microloader from boot images:
+
+```c
+// lk-payload/main.c:32-54
+size_t read_func(struct device_t *dev, uint64_t block_off, 
+                 void *dst, uint32_t sz, uint32_t part) {
+    if (block_off == g_boot * 0x200 || block_off == g_recovery * 0x200) {
+        // Reading boot or recovery partition
+        if (sz < 0x400) {
+            // Small read - skip first 0x400 bytes
+            ret = original_read(dev, block_off + 0x400, dst, sz, part);
+        } else {
+            // Large read - copy from offset 0x400 to beginning
+            void *second_copy = (char*)dst + 0x400;
+            ret = original_read(dev, block_off, dst, sz, part);
+            memcpy(dst, second_copy, 0x400);  // Move header
+            memset(second_copy, 0, 0x400);    // Clear old location
+        }
+    } else {
+        ret = original_read(dev, block_off, dst, sz, part);
+    }
+    return ret;
+}
+```
+
+This ensures the boot image appears normal to Android, even though the microloader is present on disk.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/advanced/architecture">
+    Overall exploit architecture
+  </Card>
+  <Card title="eMMC Operations" icon="database" href="/advanced/emmc-operations">
+    Complete protocol reference
+  </Card>
+</CardGroup>

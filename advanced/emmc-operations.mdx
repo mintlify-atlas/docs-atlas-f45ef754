@@ -1,0 +1,949 @@
+---
+title: eMMC Operations
+description: Complete reference for Kamakiri's eMMC protocol and operations
+icon: 'database'
+---
+
+## Protocol Overview
+
+Once stage 2 payload is loaded, Kamakiri provides full eMMC access through a custom protocol over USB serial. All commands follow the same format:
+
+```
+┌─────────────────┬──────────────────┬─────────────────────┐
+│ Magic (4 bytes) │ Command (4 bytes)│ Parameters (varies) │
+│   0xf00dd00d    │    uint32_be     │   Command-specific  │
+└─────────────────┴──────────────────┴─────────────────────┘
+```
+
+<Note>
+All multi-byte values use big-endian byte order.
+</Note>
+
+## Python Client Implementation
+
+The `Device` class in `modules/common.py` provides high-level wrappers:
+
+```python
+class Device:
+    def emmc_read(self, idx):
+        """Read a single 512-byte block"""
+        self.dev.write(p32_be(0xf00dd00d))  # magic
+        self.dev.write(p32_be(0x1000))      # command
+        self.dev.write(p32_be(idx))         # block index
+        
+        data = self.dev.read(0x200)
+        if len(data) != 0x200:
+            raise RuntimeError("read fail")
+        return data
+    
+    def emmc_write(self, idx, data):
+        """Write a single 512-byte block"""
+        if len(data) != 0x200:
+            raise RuntimeError("data must be 0x200 bytes")
+        
+        self.dev.write(p32_be(0xf00dd00d))  # magic
+        self.dev.write(p32_be(0x1001))      # command
+        self.dev.write(p32_be(idx))         # block index
+        self.dev.write(data)                # 512 bytes
+        
+        code = self.dev.read(4)
+        if code != b"\xd0\xd0\xd0\xd0":
+            raise RuntimeError("device failure")
+```
+
+---
+
+## Command Reference
+
+### 0x1000 - Read Block
+
+<ParamField path="block" type="uint32" required>
+  Block number to read (512-byte blocks)
+</ParamField>
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00001000              # Command
+0x????????              # Block number
+```
+
+**Response:**
+```
+[512 bytes of data]
+```
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:61-70
+case 0x1000: {
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    memset(buf, 0, sizeof(buf));
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, sizeof(buf));
+    }
+    break;
+}
+```
+
+**MMC Driver:**
+```c
+// brom-payload/drivers/mmc.c:137-154
+int mmc_read(struct msdc_host *host, uint32_t blk, void *buf)
+{
+    int err;
+    struct mmc_command cmd = { 0 };
+    
+    cmd.opcode = MMC_READ_SINGLE_BLOCK;  // CMD17
+    cmd.arg = blk;  // Block address
+    cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+    
+    msdc_set_blknum(host, 1);
+    
+    err = msdc_cmd(host, &cmd);
+    if (err)
+        return err;
+    
+    return msdc_pio_read(host, buf);  // PIO data transfer
+}
+```
+
+**Python Usage:**
+```python
+# Read block 0 (MBR)
+dev.emmc_switch(0)  # User partition
+block_data = dev.emmc_read(0)
+print(block_data.hex())
+
+# Read GPT header
+gpt_header = dev.emmc_read(1)
+```
+
+<Warning>
+Block numbers are relative to the current partition. Always use `emmc_switch()` to select the correct partition first.
+</Warning>
+
+---
+
+### 0x1001 - Write Block
+
+<ParamField path="block" type="uint32" required>
+  Block number to write (512-byte blocks)
+</ParamField>
+
+<ParamField path="data" type="bytes[512]" required>
+  512 bytes of data to write
+</ParamField>
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00001001              # Command
+0x????????              # Block number
+[512 bytes of data]
+```
+
+**Response:**
+```
+0xd0d0d0d0              # Success
+```
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:72-83
+case 0x1001: {
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    memset(buf, 0, sizeof(buf));
+    recv_data(buf, 0x200, 0);
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        printf("OK\n");
+        send_dword(0xD0D0D0D0);
+    }
+    break;
+}
+```
+
+**MMC Driver:**
+```c
+// brom-payload/drivers/mmc.c:156-173
+int mmc_write(struct msdc_host *host, uint32_t blk, void *buf)
+{
+    int err;
+    struct mmc_command cmd = { 0 };
+    
+    cmd.opcode = MMC_WRITE_BLOCK;  // CMD24
+    cmd.arg = blk;
+    cmd.flags = MMC_RSP_R1 | MMC_CMD_ADTC;
+    
+    msdc_set_blknum(host, 1);
+    
+    err = msdc_cmd(host, &cmd);
+    if (err)
+        return err;
+    
+    return msdc_pio_write(host, buf);  // PIO data transfer
+}
+```
+
+**Python Usage:**
+```python
+# Modify boot partition
+dev.emmc_switch(0)  # User partition
+block = dev.emmc_read(100)
+modified_block = bytearray(block)
+modified_block[0:8] = b"MODIFIED"
+dev.emmc_write(100, bytes(modified_block))
+```
+
+<Warning>
+Writing to the wrong partition or block can brick your device. Always verify partition and block number before writing.
+</Warning>
+
+---
+
+### 0x1002 - Switch Partition
+
+<ParamField path="partition" type="uint32" required>
+  Partition number (0-3)
+</ParamField>
+
+**Partition Map:**
+
+| Number | Name | Description | Access |
+|--------|------|-------------|--------|
+| 0 | User | Main data partition with GPT | Read/Write |
+| 1 | Boot0 | Boot partition 0 | Read/Write |
+| 2 | Boot1 | Boot partition 1 | Read/Write |
+| 3 | RPMB | Replay Protected Memory Block | Special |
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00001002              # Command
+0x????????              # Partition (0-3)
+```
+
+**Response:**
+None (command completes silently)
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:85-92
+case 0x1002: {
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    ret = mmc_set_part(host, part);
+    printf("0x%08X\n", ret);
+    mdelay(500);  // just in case
+    break;
+}
+```
+
+**MMC Driver:**
+```c
+// brom-payload/drivers/mmc.c:337-339
+int mmc_set_part(struct msdc_host *host, int part) {
+    // EXT_CSD[179] = 72 | part
+    return mmc_switch(host, EXT_CSD_CMD_SET_NORMAL, 
+                     EXT_CSD_PART_CONFIG, 72 | part, 0);
+}
+```
+
+The partition configuration is stored in the eMMC Extended CSD register 179:
+```
+Bits 0-2: PARTITION_ACCESS
+  000 = User area
+  001 = Boot partition 1
+  010 = Boot partition 2
+  011 = RPMB partition
+
+Bits 3-5: BOOT_PARTITION_ENABLE
+  001 = Boot partition 1 enabled
+  010 = Boot partition 2 enabled
+
+Bits 6: BOOT_ACK
+```
+
+The value `72` = `0x48` = `0b01001000` sets bits 3 and 6 (boot partition 1 enabled with ACK).
+
+**Python Usage:**
+```python
+# Switch to user partition
+dev.emmc_switch(0)
+mbr = dev.emmc_read(0)
+
+# Switch to boot0
+dev.emmc_switch(1)
+boot0_header = dev.emmc_read(0)
+
+# Switch to boot1 (often contains IDME on Amazon devices)
+dev.emmc_switch(2)
+idme_data = dev.emmc_read(0)
+```
+
+**Helper Functions:**
+```python
+# modules/functions.py:36-46
+def switch_boot0(dev):
+    dev.emmc_switch(1)
+    block = dev.emmc_read(0)
+    if block[0:9] != b"EMMC_BOOT" and block != b"\x00" * 0x200:
+        dev.reboot()
+        raise RuntimeError("what's wrong with your BOOT0?")
+    dev.kick_watchdog()
+
+def switch_user(dev):
+    dev.emmc_switch(0)
+    block = dev.emmc_read(0)
+    if block[510:512] != b"\x55\xAA":  # MBR signature
+        dev.reboot()
+        raise RuntimeError("what's wrong with your GPT?")
+    dev.kick_watchdog()
+```
+
+---
+
+### 0x2000 - Read RPMB
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00002000              # Command
+```
+
+**Response:**
+```
+[256 bytes of RPMB data]
+```
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:93-98
+case 0x2000: {
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);  // 256 bytes
+    break;
+}
+```
+
+**RPMB Driver:**
+```c
+// brom-payload/drivers/mmc.c:742-783
+int mmc_rpmb_read(struct msdc_host *host, void *buf) {
+    struct mmc_core_rpmb_req rpmb_req = { 0 };
+    struct mmc_ioc_rpmb_req req = { 0 };
+    uint16_t result = 0;
+    uint8_t nonce[32] = { 0 };
+    
+    req.type = RPMB_READ_DATA;
+    req.blk_cnt = 1;
+    req.result = &result;
+    req.nonce = nonce;
+    req.addr = 0;
+    req.data = buf;
+    rpmb_req.req = &req;
+    
+    // Prepare RPMB frame
+    mmc_rpmb_pre_frame(&rpmb_req, host);
+    
+    // Switch to RPMB partition
+    mmc_set_part(host, 3);
+    
+    // Perform RPMB operation
+    mmc_rpmb_partition_ops(&rpmb_req, host);
+    
+    // Parse response frame
+    mmc_rpmb_post_frame(&rpmb_req);
+    
+    // Convert from big-endian
+    byteswap(buf, 0x100);
+    
+    return ret;
+}
+```
+
+**RPMB Frame Format:**
+```
+Offset | Size | Field
+-------|------|------------------
+  0    |  256 | Data
+ 256   |   16 | Nonce
+ 272   |   32 | Write Counter (BE)
+ 304   |    2 | Address (BE)
+ 306   |    2 | Block Count (BE)
+ 308   |    2 | Result (BE)
+ 310   |    2 | Request/Response Type (BE)
+ 312   |   32 | MAC (HMAC-SHA256)
+```
+
+**Python Usage:**
+```python
+# Read RPMB data
+rpmb_data = dev.rpmb_read()
+print("RPMB first 4 bytes:", rpmb_data[0:4].hex())
+
+# Check if RPMB is from Amazon device
+if rpmb_data[0:4] == b"AMZN":
+    print("Amazon RPMB detected")
+```
+
+<Note>
+RPMB (Replay Protected Memory Block) is a special secure storage area that requires HMAC-SHA256 authentication. Kamakiri derives the RPMB key from the device's eMMC CID.
+</Note>
+
+---
+
+### 0x2001 - Write RPMB
+
+<ParamField path="data" type="bytes[256]" required>
+  256 bytes of data to write to RPMB
+</ParamField>
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00002001              # Command
+[256 bytes of data]
+```
+
+**Response:**
+None (command completes silently)
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:99-104
+case 0x2001: {
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+**RPMB Write Driver:**
+```c
+// brom-payload/drivers/mmc.c:911-969
+int mmc_rpmb_write(struct msdc_host *host, void *buf) {
+    struct mmc_core_rpmb_req rpmb_req = { 0 };
+    struct mmc_ioc_rpmb_req req = { 0 };
+    uint16_t result = 0;
+    uint8_t nonce[32] = { 0 };
+    uint8_t mac[32] = { 0 };
+    uint32_t wc;
+    
+    uint8_t tmp[0x100];
+    memcpy(tmp, buf, sizeof(tmp));
+    byteswap(tmp, sizeof(tmp));
+    
+    // Get current write counter
+    mmc_rpmb_get_write_count(host, &wc);
+    printf("wc = %d\n", wc);
+    
+    req.type = RPMB_WRITE_DATA;
+    req.blk_cnt = 1;
+    req.result = &result;
+    req.nonce = nonce;
+    req.addr = 0;
+    req.data = tmp;
+    req.wc = &wc;
+    req.mac = mac;
+    rpmb_req.req = &req;
+    
+    // Prepare frame
+    mmc_rpmb_pre_frame(&rpmb_req, host);
+    
+    // Calculate HMAC-SHA256
+    rpmb_calc_mac(&rpmb_req);
+    
+    // Switch to RPMB partition
+    mmc_set_part(host, 3);
+    
+    // Perform write
+    mmc_rpmb_partition_ops(&rpmb_req, host);
+    
+    // Check result
+    mmc_rpmb_post_frame(&rpmb_req);
+    printf("result = %d\n", result);
+    
+    return ret;
+}
+```
+
+**MAC Calculation:**
+```c
+// brom-payload/drivers/mmc.c:891-909
+void rpmb_calc_mac(struct mmc_core_rpmb_req *rpmb_req) {
+    struct mmc_ioc_rpmb_req *req = rpmb_req->req;
+    
+    // HMAC-SHA256 over frame data (everything after first 256 bytes)
+    hmac_sha256(req->mac, 
+                rpmb_req->frame + RPMB_DATA_BEG,  // offset 0
+                512 - RPMB_DATA_BEG,               // 512 bytes
+                rpmb_key,                          // key from CID
+                sizeof(rpmb_key));                 // 32 bytes
+    
+    // Copy MAC to frame
+    memcpy(rpmb_req->frame + RPMB_MAC_BEG, req->mac, 32);
+}
+```
+
+**Python Usage:**
+```python
+# Zero out RPMB to enable downgrade
+dev.rpmb_write(b"\x00" * 0x100)
+
+# Verify
+rpmb = dev.rpmb_read()
+if rpmb != b"\x00" * 0x100:
+    raise RuntimeError("RPMB write failed")
+```
+
+<Warning>
+Zeroing the RPMB is a critical step in the exploit that enables firmware downgrade. The RPMB stores rollback protection counters.
+</Warning>
+
+---
+
+### 0x5000 - Read Memory
+
+<ParamField path="address" type="uint32" required>
+  Physical memory address to read
+</ParamField>
+
+<ParamField path="size" type="uint32" required>
+  Number of bytes to read
+</ParamField>
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00005000              # Command
+0x????????              # Address
+0x????????              # Size
+```
+
+**Response:**
+```
+[size bytes of memory]
+```
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:105-111
+case 0x5000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+```
+
+**Python Implementation:**
+```python
+# modules/common.py:265-279
+def mem_read(self, address, size):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x5000))
+    # address
+    self.dev.write(p32_be(address))
+    # size
+    self.dev.write(p32_be(size))
+    
+    data = self.dev.read(size)
+    if len(data) != size:
+        raise RuntimeError("read fail")
+    
+    return data
+```
+
+**Usage Examples:**
+```python
+# Dump bootrom (read-only region)
+bootrom = dev.mem_read(0x00000000, 0x20000)
+with open("bootrom.bin", "wb") as f:
+    f.write(bootrom)
+
+# Read UART registers
+uart_lsr = dev.mem_read(0x11003014, 4)
+print("UART LSR:", uart_lsr.hex())
+
+# Read watchdog registers
+watchdog = dev.mem_read(0x10007000, 0x100)
+```
+
+<Warning>
+Reading from invalid memory addresses may cause the device to crash. Always verify addresses are valid for your SoC.
+</Warning>
+
+---
+
+### 0x7000 - Read IDME
+
+<ParamField path="field_name" type="bytes[16]" required>
+  IDME field name (null-padded to 16 bytes)
+</ParamField>
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00007000              # Command
+[16 bytes field name]
+```
+
+**Response:**
+```
+[4 bytes length]
+[length bytes of data]
+```
+
+Or error codes:
+- `0xffffffff` - Read fail
+- `0xbeefdeed` - IDME invalid
+- `0xdeadbeef` - Field not found
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:112-172
+case 0x7000: {
+    char idme_buf[0x400] = { 0 };
+    char field_name[16] = { 0 };
+    const char beefdeed[] = "beefdeed";
+    uint32_t result = 0;
+    
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    
+    // Switch to boot1 partition where IDME is stored
+    ret = mmc_set_part(host, 2);
+    
+    uint32_t block = 0;
+    void *type_offset = 0;
+    
+    // Search for field in IDME partition
+    while (!(type_offset = memmem(idme_buf, 0x400, &field_name, 16)) 
+           && block < 0x2000) {
+        memset(buf, 0, sizeof(buf));
+        if (mmc_read(host, block++, buf) != 0) {
+            result = 0xffffffff;
+            break;
+        }
+        
+        // Verify IDME magic on first data block
+        if (block == 1 && memcmp(buf, &beefdeed, 8)) {
+            printf("IDME invalid!\n");
+            result = 0xbeefdeed;
+            break;
+        }
+        
+        // Sliding window search
+        memcpy(idme_buf, idme_buf + 0x200, 0x200);
+        memcpy(idme_buf + 0x200, buf, 0x200);
+    }
+    
+    if (type_offset) {
+        // Found the field
+        uint32_t len = *(uint32_t*)(type_offset + 16);
+        type_offset += 16 + 12;  // Skip to data
+        send_dword(len);
+        send_data(type_offset, len);
+    } else if (!result) {
+        result = 0xdeadbeef;  // Not found
+    }
+    
+    if (result) {
+        send_dword(4);
+        send_dword(result);
+    }
+    break;
+}
+```
+
+**IDME Structure:**
+```
+Block 0: Header
+  0x000-0x007: Magic "beefdeed" (ASCII)
+  0x008-...:   IDME version info
+
+Blocks 1+: Field entries
+  Each entry:
+    0x00-0x0F: Field name (16 bytes, null-terminated)
+    0x10-0x13: Data length (uint32_le)
+    0x14-0x1B: Timestamp (uint64_le)
+    0x1C-0x1F: Flags (uint32_le)
+    0x20-...:  Field data
+```
+
+**Python Implementation:**
+```python
+# modules/common.py:281-303
+def idme_read(self, field_name):
+    # magic
+    self.dev.write(p32_be(0xf00dd00d))
+    # cmd
+    self.dev.write(p32_be(0x7000))
+    
+    # Pad field name to 16 bytes
+    if len(field_name) < 16:
+        field_name += b"\x00" * (16 - len(field_name))
+    self.dev.write(field_name)
+    
+    size = int.from_bytes(self.dev.read(4), byteorder="big")
+    data = self.dev.read(size)
+    
+    if len(data) != size or data == to_bytes(0xffffffff, 4):
+        raise RuntimeError("read fail")
+    elif data == to_bytes(0xbeefdeed, 4):
+        raise RuntimeError("IDME invalid")
+    elif data == to_bytes(0xdeadbeef, 4):
+        log(field_name + " not found in IDME")
+        return None
+    
+    return data
+```
+
+**Common IDME Fields:**
+```python
+# Read device type
+device_type = dev.idme_read(b"device_type_id")
+print("Device:", device_type.rstrip(b"\x00").decode("utf-8"))
+
+# Read serial number
+serial = dev.idme_read(b"serial")
+print("Serial:", serial.hex())
+
+# Read MAC address
+mac = dev.idme_read(b"mac_addr")
+print("MAC:", mac.hex())
+
+# Read board ID
+board_id = dev.idme_read(b"board_id")
+print("Board ID:", board_id.rstrip(b"\x00").decode("utf-8"))
+```
+
+---
+
+### 0x3000 - Reboot
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00003000              # Command
+```
+
+**Response:**
+None (device reboots immediately)
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:173-182
+case 0x3000: {
+    printf("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;      // WDT_MODE unlock
+    reg[0/4] = 0x22000014;  // WDT_MODE enable with timeout
+    reg[0x14/4] = 0x1209;   // WDT_SWRST reset key
+    
+    while (1) {}
+}
+```
+
+**Watchdog Registers:**
+```
+0x10007000 (WDT_MODE):
+  Bit 0: Enable
+  Bit 1: External signal
+  Bit 4: IRQ enable
+  Write 0x22000014 to enable with 4-second timeout
+
+0x10007008 (WDT_MODE unlock):
+  Must write 0x1971 before modifying WDT_MODE
+
+0x10007014 (WDT_SWRST):
+  Write 0x1209 to trigger immediate reset
+```
+
+**Python Usage:**
+```python
+# Reboot device
+dev.reboot()
+# Device will disconnect and reboot
+```
+
+---
+
+### 0x3001 - Kick Watchdog
+
+**Request:**
+```
+0xf00dd00d              # Magic
+0x00003001              # Command
+```
+
+**Response:**
+None (command completes silently)
+
+**C Implementation:**
+```c
+// brom-payload/payload_common.c:184-189
+case 0x3001: {
+    printf("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;  // Unlock and kick
+    break;
+}
+```
+
+**Python Usage:**
+```python
+# Keep device alive during long operations
+for i in range(large_operation):
+    # ... do work ...
+    if i % 10 == 0:
+        dev.kick_watchdog()
+```
+
+<Note>
+The watchdog timer will reset the device after approximately 4 seconds if not kicked. Always kick the watchdog during long operations.
+</Note>
+
+---
+
+## High-Level Operations
+
+### Flash Binary File
+
+```python
+# modules/functions.py:63-69
+def flash_binary(dev, path, start_block, max_size=0):
+    with open(path, "rb") as fin:
+        data = fin.read()
+    
+    # Pad to 512-byte blocks
+    while len(data) % 0x200 != 0:
+        data += b"\x00"
+    
+    if max_size and len(data) > max_size:
+        raise RuntimeError("data too big to flash")
+    
+    blocks = len(data) // 0x200
+    for x in range(blocks):
+        print("[{} / {}]".format(x + 1, blocks), end='\r')
+        dev.emmc_write(start_block + x, data[x * 0x200:(x + 1) * 0x200])
+        if x % 10 == 0:
+            dev.kick_watchdog()
+    print("")
+```
+
+### Dump Binary File
+
+```python
+# modules/functions.py:71-79
+def dump_binary(dev, path, start_block, max_size=0):
+    with open(path, "w+b") as fout:
+        blocks = max_size // 0x200
+        for x in range(blocks):
+            print("[{} / {}]".format(x + 1, blocks), end='\r')
+            fout.write(dev.emmc_read(start_block + x))
+            if x % 10 == 0:
+                dev.kick_watchdog()
+    print("")
+```
+
+### Parse GPT
+
+```python
+# modules/functions.py:117-128
+def parse_gpt(dev):
+    # Read GPT entries from blocks 2, 3, 4, 5
+    data = (dev.emmc_read(0x400 // 0x200) + 
+            dev.emmc_read(0x600 // 0x200) + 
+            dev.emmc_read(0x800 // 0x200) + 
+            dev.emmc_read(0xA00 // 0x200))
+    
+    num = len(data) // 0x80  # 128-byte entries
+    parts = dict()
+    
+    for x in range(num):
+        part = data[x * 0x80:(x + 1) * 0x80]
+        part_name = part[0x38:].decode("utf-16le").rstrip("\x00")
+        part_start = struct.unpack("<Q", part[0x20:0x28])[0]
+        part_end = struct.unpack("<Q", part[0x28:0x30])[0]
+        parts[part_name] = (part_start, part_end - part_start + 1)
+    
+    return parts
+```
+
+**Usage:**
+```python
+dev.emmc_switch(0)  # User partition
+gpt = parse_gpt(dev)
+print("Partitions:", gpt.keys())
+print("Boot partition:", gpt["boot"])
+# Output: (start_block, num_blocks)
+```
+
+---
+
+## Complete Usage Example
+
+```python
+from modules.common import Device
+from modules.load_payload import load_payload
+from modules.functions import *
+
+# Connect to device
+dev = Device()
+dev.find_device()
+
+# Load stage 1 and stage 2 payloads
+load_payload(dev)
+
+# Read device information
+device_type = dev.idme_read(b"device_type_id")
+print("Device:", device_type.rstrip(b"\x00").decode("utf-8"))
+
+# Parse partition table
+switch_user(dev)
+gpt = parse_gpt(dev)
+print("Partitions:", list(gpt.keys()))
+
+# Dump boot partition
+switch_user(dev)
+boot_start, boot_size = gpt["boot"]
+dump_binary(dev, "boot.img", boot_start, boot_size * 0x200)
+
+# Read RPMB
+rpmb = dev.rpmb_read()
+if rpmb[0:4] == b"AMZN":
+    print("Amazon RPMB detected")
+    # Zero RPMB for downgrade
+    dev.rpmb_write(b"\x00" * 0x100)
+
+# Flash modified boot image
+switch_user(dev)
+flash_binary(dev, "modified_boot.img", boot_start)
+
+# Reboot
+dev.reboot()
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/advanced/architecture">
+    Overall exploit architecture
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Common issues and solutions
+  </Card>
+</CardGroup>

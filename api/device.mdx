@@ -1,0 +1,708 @@
+---
+title: 'Device Class'
+description: 'Core API for communicating with MediaTek devices via bootrom exploit'
+---
+
+The `Device` class provides the primary interface for interacting with MediaTek devices through the bootrom exploit. It handles serial communication, memory operations, eMMC access, and payload execution.
+
+## Constants
+
+These constants are defined in `modules/common.py` and used throughout the API:
+
+<ParamField path="BAUD" type="int" default="115200">
+  Serial communication baud rate
+</ParamField>
+
+<ParamField path="TIMEOUT" type="int" default="5">
+  Serial communication timeout in seconds
+</ParamField>
+
+<ParamField path="VID" type="str" default="0E8D">
+  MediaTek USB vendor ID
+</ParamField>
+
+<ParamField path="PID" type="str" default="0003">
+  MediaTek bootrom USB product ID
+</ParamField>
+
+<ParamField path="CRYPTO_BASE" type="int" default="0x10210000">
+  Crypto engine base address for Karnak SoC
+</ParamField>
+
+## Constructor
+
+### Device(port=None)
+
+Initializes a new Device instance.
+
+<ParamField path="port" type="str" default="None">
+  Optional serial port path (e.g., `/dev/ttyUSB0`). If not provided, use `find_device()` to auto-detect.
+</ParamField>
+
+<ResponseField name="dev" type="serial.Serial">
+  The underlying pySerial device object, or `None` if port was not specified
+</ResponseField>
+
+<ResponseField name="preloader" type="bool" default="False">
+  Flag indicating whether device is in preloader mode (set by `find_device()`)
+</ResponseField>
+
+```python
+# Manual port specification
+dev = Device('/dev/ttyUSB0')
+
+# Auto-detection
+dev = Device()
+dev.find_device()
+```
+
+## Device Detection
+
+### find_device()
+
+Waits for a MediaTek device to be connected and automatically opens the serial port.
+
+<ResponseField name="raises" type="RuntimeError">
+  If a device is already connected (dev is not None)
+</ResponseField>
+
+This method:
+- Monitors for new serial ports matching the MediaTek VID
+- Automatically detects preloader vs bootrom mode
+- Sets `self.preloader = True` if not in bootrom mode (PID != 0003)
+- Opens the serial connection at 115200 baud
+
+```python
+dev = Device()
+dev.find_device()  # Blocks until device connected
+# Device is now ready for communication
+```
+
+## Handshake & Initialization
+
+### handshake()
+
+Performs bootrom handshake sequence to establish communication.
+
+The handshake sequence:
+1. Sends `0xA0` and waits for `0x5F` response
+2. Sends `0x0A` and expects `0xF5`
+3. Sends `0x50` and expects `0xAF`
+4. Sends `0x05` and expects `0xFA`
+
+<ResponseField name="raises" type="RuntimeError">
+  If any response doesn't match expected value (protocol mismatch)
+</ResponseField>
+
+```python
+dev.handshake()
+log("Bootrom handshake complete")
+```
+
+### handshake2(cmd='FACTFACT')
+
+Performs preloader handshake by sending a factory command.
+
+<ParamField path="cmd" type="str" default="FACTFACT">
+  Command string to send to preloader (typically 8 characters)
+</ParamField>
+
+This method:
+- Waits for 'Y' byte from preloader
+- Sends the command string
+- Flushes input buffer
+
+```python
+if dev.preloader:
+    dev.handshake2('FACTFACT')
+```
+
+## Memory Operations
+
+### read32(addr, size=1)
+
+Reads 32-bit words from device memory.
+
+<ParamField path="addr" type="int" required>
+  Memory address to read from (must be 4-byte aligned)
+</ParamField>
+
+<ParamField path="size" type="int" default="1">
+  Number of 32-bit words to read
+</ParamField>
+
+<ResponseField name="return" type="int | list[int]">
+  Single integer if size=1, otherwise list of integers
+</ResponseField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If device echoes don't match or status check fails
+</ResponseField>
+
+Protocol:
+1. Sends command `0xD1`
+2. Sends address (big-endian 32-bit)
+3. Sends size (big-endian 32-bit)
+4. Receives data words (big-endian)
+5. Verifies status bytes `0x00 0x00`
+
+```python
+# Read single word
+value = dev.read32(0x10007000)
+print(f"Value: 0x{value:08X}")
+
+# Read multiple words
+data = dev.read32(0x10007000, 4)
+for i, word in enumerate(data):
+    print(f"[{i}] = 0x{word:08X}")
+```
+
+### write32(addr, words, status_check=True)
+
+Writes 32-bit words to device memory.
+
+<ParamField path="addr" type="int" required>
+  Memory address to write to (must be 4-byte aligned)
+</ParamField>
+
+<ParamField path="words" type="int | list[int]" required>
+  Single word or list of words to write
+</ParamField>
+
+<ParamField path="status_check" type="bool" default="True">
+  Whether to verify status bytes after write
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If device echoes don't match or status check fails
+</ResponseField>
+
+Protocol:
+1. Sends command `0xD4`
+2. Sends address (big-endian 32-bit)
+3. Sends count (big-endian 32-bit)
+4. Expects arg check `0x00 0x01`
+5. Sends each word (big-endian) and verifies echo
+6. Verifies status `0x00 0x01` if status_check=True
+
+```python
+# Disable watchdog
+dev.write32(0x10007000, 0x22000000)
+
+# Write multiple words
+dev.write32(0x10007050, [0xA1000, 0x00000000, 0x12345678])
+
+# Write without status check (faster)
+dev.write32(0x10007050, 0xA1000, status_check=False)
+```
+
+## Extended Commands
+
+### run_ext_cmd(cmd)
+
+Executes an extended bootrom command.
+
+<ParamField path="cmd" type="int" required>
+  Command byte to execute
+</ParamField>
+
+Protocol:
+1. Sends command `0xC8`
+2. Sends cmd byte
+3. Reads 4 bytes response (1 byte data + 2 status bytes)
+
+```python
+dev.run_ext_cmd(0x01)  # Execute extended command 0x01
+```
+
+### wait_payload()
+
+Waits for payload ready signal.
+
+<ResponseField name="raises" type="RuntimeError">
+  If magic pattern `0xB1B2B3B4` is not received
+</ResponseField>
+
+Used after jumping to a payload to confirm it started successfully.
+
+```python
+dev.jump_da(0x40001000)
+dev.wait_payload()  # Blocks until payload signals ready
+log("Payload online")
+```
+
+## eMMC Operations
+
+### emmc_read(idx)
+
+Reads a single 512-byte block from eMMC.
+
+<ParamField path="idx" type="int" required>
+  Block index to read
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  512 bytes of data from the specified block
+</ResponseField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If read fails or returns incomplete data
+</ResponseField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x1000` (READ)
+3. Sends block index
+4. Receives 512 bytes
+
+```python
+# Read boot sector
+block = dev.emmc_read(0)
+if block[510:512] == b"\x55\xAA":
+    log("Valid MBR found")
+
+# Read GPT header
+gpt_header = dev.emmc_read(1)
+```
+
+### emmc_write(idx, data)
+
+Writes a single 512-byte block to eMMC.
+
+<ParamField path="idx" type="int" required>
+  Block index to write
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Exactly 512 bytes to write
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If data is not 512 bytes or device reports failure
+</ResponseField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x1001` (WRITE)
+3. Sends block index
+4. Sends 512 bytes of data
+5. Expects success code `0xD0D0D0D0`
+
+```python
+# Modify and write back a block
+block = list(dev.emmc_read(100))
+block[0:4] = b"TEST"
+dev.emmc_write(100, bytes(block))
+```
+
+### emmc_switch(part)
+
+Switches eMMC partition.
+
+<ParamField path="part" type="int" required>
+  Partition number: 0=User, 1=Boot0, 2=Boot1
+</ParamField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x1002` (SWITCH)
+3. Sends partition number
+
+```python
+# Switch to user partition
+dev.emmc_switch(0)
+
+# Switch to boot0
+dev.emmc_switch(1)
+
+# Switch to boot1
+dev.emmc_switch(2)
+```
+
+## RPMB Operations
+
+### rpmb_read()
+
+Reads 256 bytes from RPMB (Replay Protected Memory Block).
+
+<ResponseField name="return" type="bytes">
+  256 bytes of RPMB data
+</ResponseField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If read fails or returns incomplete data
+</ResponseField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x2000` (RPMB_READ)
+3. Receives 256 bytes
+
+```python
+rpmb = dev.rpmb_read()
+if rpmb[0:4] == b"AMZN":
+    log("Amazon RPMB header found")
+```
+
+### rpmb_write(data)
+
+Writes 256 bytes to RPMB.
+
+<ParamField path="data" type="bytes" required>
+  Exactly 256 bytes to write
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If data is not 256 bytes
+</ResponseField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x2001` (RPMB_WRITE)
+3. Sends 256 bytes of data
+
+```python
+# Zero out RPMB (enables downgrade)
+dev.rpmb_write(b"\x00" * 0x100)
+
+# Verify
+rpmb = dev.rpmb_read()
+assert rpmb == b"\x00" * 0x100
+```
+
+## Memory & IDME Operations
+
+### mem_read(address, size)
+
+Reads arbitrary memory region.
+
+<ParamField path="address" type="int" required>
+  Physical memory address to read from
+</ParamField>
+
+<ParamField path="size" type="int" required>
+  Number of bytes to read
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  Requested bytes from memory
+</ResponseField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If read fails or returns incomplete data
+</ResponseField>
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x5000` (MEM_READ)
+3. Sends address (big-endian 32-bit)
+4. Sends size (big-endian 32-bit)
+5. Receives data
+
+```python
+# Read 1KB from SRAM
+sram_data = dev.mem_read(0x00100000, 1024)
+
+# Read crypto registers
+crypto_regs = dev.mem_read(0x10210000, 256)
+```
+
+### idme_read(field_name)
+
+Reads a field from IDME (ID ME) partition.
+
+<ParamField path="field_name" type="bytes" required>
+  Field name to read (max 16 bytes, auto-padded with nulls)
+</ParamField>
+
+<ResponseField name="return" type="bytes | None">
+  Field data if found, None if field doesn't exist
+</ResponseField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If read fails or IDME is invalid
+</ResponseField>
+
+Special return values:
+- `0xFFFFFFFF`: Read failure
+- `0xBEEFDEED`: IDME invalid
+- `0xDEADBEEF`: Field not found (returns None)
+
+```python
+# Read device type
+device_type = dev.idme_read(b"device_type_id")
+if device_type:
+    print(f"Device: {device_type.rstrip(b'\\x00').decode('utf-8')}")
+
+# Read serial number
+serial = dev.idme_read(b"serial")
+if serial:
+    print(f"Serial: {serial.decode('utf-8')}")
+```
+
+## System Control
+
+### reboot()
+
+Reboots the device.
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x3000` (REBOOT)
+
+Device will disconnect and restart.
+
+```python
+log("Flashing complete, rebooting...")
+dev.reboot()
+time.sleep(2)
+```
+
+### kick_watchdog()
+
+Resets the watchdog timer to prevent reboot.
+
+Protocol:
+1. Sends magic `0xF00DD00D`
+2. Sends command `0x3001` (KICK_WATCHDOG)
+
+Should be called periodically during long operations.
+
+```python
+for i in range(100):
+    dev.emmc_write(i, data[i*512:(i+1)*512])
+    if i % 10 == 0:
+        dev.kick_watchdog()  # Prevent timeout every 10 blocks
+```
+
+## Download Agent (DA) Operations
+
+### send_da(da_address, da_len, sig_len, da)
+
+Sends a Download Agent (payload) to device memory.
+
+<ParamField path="da_address" type="int" required>
+  Target memory address to load DA
+</ParamField>
+
+<ParamField path="da_len" type="int" required>
+  Length of DA payload in bytes
+</ParamField>
+
+<ParamField path="sig_len" type="int" required>
+  Length of signature (usually 0 for exploits)
+</ParamField>
+
+<ParamField path="da" type="bytes" required>
+  DA payload binary data
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If device echoes don't match or status checks fail
+</ResponseField>
+
+Protocol:
+1. Sends command `0xD7`
+2. Sends address, length, signature length (all echoed)
+3. Expects status `0x00 0x00`
+4. Sends payload data
+5. Receives checksum (2 bytes)
+6. Expects status `0x00 0x00`
+
+```python
+# Load stage1 payload
+with open("stage1.bin", "rb") as f:
+    payload = f.read()
+
+dev.send_da(0x40001000, len(payload), 0, payload)
+log(f"Sent {len(payload)} bytes to 0x40001000")
+```
+
+### jump_da(da_address)
+
+Jumps execution to a previously loaded Download Agent.
+
+<ParamField path="da_address" type="int" required>
+  Memory address to jump to (must match address from send_da)
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If status check fails
+</ResponseField>
+
+Protocol:
+1. Sends command `0xD5`
+2. Sends address (echoed)
+3. Expects status `0x00 0x00`
+4. Bootrom jumps to DA code
+
+```python
+# Load and execute payload
+dev.send_da(0x40001000, len(payload), 0, payload)
+dev.jump_da(0x40001000)
+dev.wait_payload()  # Wait for payload to initialize
+```
+
+### crash_pl()
+
+Attempts to crash the preloader to return to bootrom mode.
+
+Sends a malicious ARM payload that causes preloader to crash:
+```
+0x00019FE5  // ldr r0, [pc, #0]
+0x10FF2FE1  // mov pc, r0
+```
+
+Useful when device boots into preloader but you need bootrom access.
+
+<ResponseField name="raises" type="RuntimeError">
+  Caught and logged, but not re-raised
+</ResponseField>
+
+```python
+if dev.preloader:
+    log("Attempting to crash preloader...")
+    dev.handshake()
+    dev.crash_pl()
+    dev.dev.close()
+    
+    # Re-detect in bootrom mode
+    dev = Device()
+    dev.find_device()
+```
+
+## Low-Level I/O
+
+### write(data, size=1)
+
+Writes raw data to serial port.
+
+<ParamField path="data" type="int | bytes" required>
+  Data to write (converted to bytes if int)
+</ParamField>
+
+<ParamField path="size" type="int" default="1">
+  If data is int, number of bytes (1, 2, or 4)
+</ParamField>
+
+```python
+# Write bytes
+dev.write(b"\xF0\x0D")
+
+# Write integer as big-endian 32-bit
+dev.write(0xF00DD00D, 4)
+```
+
+### read(size=1)
+
+Reads raw bytes from serial port.
+
+<ParamField path="size" type="int" default="1">
+  Number of bytes to read
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  Bytes read from device
+</ResponseField>
+
+```python
+response = dev.read(4)
+if response == b"\xD0\xD0\xD0\xD0":
+    log("Success")
+```
+
+### echo(words, size=1)
+
+Writes data and verifies device echoes it back.
+
+<ParamField path="words" type="int" required>
+  Data to write and verify
+</ParamField>
+
+<ParamField path="size" type="int" default="1">
+  Number of bytes (1, 2, or 4)
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If echo doesn't match sent data
+</ResponseField>
+
+Used internally by send_da and jump_da.
+
+```python
+dev.echo(0xD7)  # Send 0xD7, expect 0xD7 back
+dev.echo(0x40001000, 4)  # Send address, expect echo
+```
+
+## Complete Usage Example
+
+```python
+from modules.common import Device
+from modules.logger import log
+import time
+
+# Initialize and connect
+dev = Device()
+dev.find_device()
+
+if dev.preloader:
+    # In preloader mode, use different handshake
+    dev.handshake2('FACTFACT')
+else:
+    # In bootrom mode, perform normal handshake
+    dev.handshake()
+    
+    # Disable watchdog
+    log("Disabling watchdog")
+    dev.write32(0x10007000, 0x22000000)
+
+# Load and execute exploit payload
+with open("payload.bin", "rb") as f:
+    payload = f.read()
+
+log(f"Sending payload ({len(payload)} bytes)")
+dev.send_da(0x40001000, len(payload), 0, payload)
+dev.jump_da(0x40001000)
+dev.wait_payload()
+
+# Read device info
+device_id = dev.idme_read(b"device_type_id")
+log(f"Device: {device_id.rstrip(b'\\x00').decode('utf-8')}")
+
+# Switch to user partition and read GPT
+dev.emmc_switch(0)
+mbr = dev.emmc_read(0)
+if mbr[510:512] == b"\\x55\\xAA":
+    log("Valid partition table found")
+
+# Read RPMB
+rpmb = dev.rpmb_read()
+if rpmb[0:4] == b"AMZN":
+    log("Amazon device detected")
+    
+    # Zero RPMB to enable downgrade
+    log("Clearing RPMB")
+    dev.rpmb_write(b"\\x00" * 0x100)
+    dev.kick_watchdog()
+
+# Flash modified boot partition
+dev.emmc_switch(1)  # Boot0
+with open("boot.img", "rb") as f:
+    boot_data = f.read()
+
+blocks = (len(boot_data) + 511) // 512
+for i in range(blocks):
+    block = boot_data[i*512:(i+1)*512]
+    if len(block) < 512:
+        block += b"\\x00" * (512 - len(block))
+    
+    dev.emmc_write(i, block)
+    
+    if i % 10 == 0:
+        dev.kick_watchdog()
+        log(f"Progress: {i+1}/{blocks}")
+
+log("Flashing complete, rebooting...")
+time.sleep(2)
+dev.reboot()
+```

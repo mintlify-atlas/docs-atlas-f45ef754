@@ -1,0 +1,446 @@
+---
+title: 'Boot Scripts'
+description: 'Boot the device into fastboot or recovery mode using preloader handshake'
+---
+
+## Overview
+
+The boot scripts use the preloader handshake protocol to force the device into specific boot modes without needing hardware buttons. These scripts are useful for recovery scenarios or automated workflows.
+
+## boot-fastboot.sh
+
+### Usage
+
+```bash
+./boot-fastboot.sh
+```
+
+### Description
+
+Forces the device to boot into fastboot mode using the preloader handshake command `FACTFACT`.
+
+### What It Does
+
+```bash
+cd modules
+python3 handshake2.py FACTFACT
+cd ..
+```
+
+The script:
+
+1. Changes to the `modules` directory
+2. Executes `handshake2.py` with the magic command `FACTFACT`
+3. Returns to the parent directory
+
+### Handshake Protocol
+
+The `FACTFACT` command is a special preloader command that:
+- Intercepts the normal boot sequence
+- Skips loading the regular boot image
+- Launches the fastboot bootloader instead
+- Enables USB fastboot interface
+
+### Expected Output
+
+```bash
+$ ./boot-fastboot.sh
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyACM0
+[INFO] Handshake
+[INFO] Sending handshake command: FACTFACT
+[INFO] Device will boot to fastboot mode
+```
+
+### Device Behavior
+
+After running this script:
+
+1. Device display shows fastboot logo or remains blank
+2. Device appears as fastboot device: `fastboot devices`
+3. Fastboot commands are now available
+4. Device remains in fastboot until manually rebooted
+
+### When to Use
+
+<CardGroup cols={2}>
+  <Card title="After Exploit" icon="forward">
+    Boot into fastboot after running bootrom-step.sh
+  </Card>
+  <Card title="Recovery" icon="rotate">
+    Force fastboot mode if device won't boot normally
+  </Card>
+  <Card title="Development" icon="code">
+    Quickly access fastboot without button combinations
+  </Card>
+  <Card title="Automation" icon="robot">
+    Script automated flashing workflows
+  </Card>
+</CardGroup>
+
+---
+
+## boot-recovery.sh
+
+### Usage
+
+```bash
+./boot-recovery.sh
+```
+
+### Description
+
+Forces the device to boot into recovery mode using the preloader handshake command `FACTORYM`.
+
+### What It Does
+
+```bash
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+The script:
+
+1. Changes to the `modules` directory
+2. Executes `handshake2.py` with the magic command `FACTORYM`
+3. Returns to the parent directory
+
+### Handshake Protocol
+
+The `FACTORYM` command is a special preloader command that:
+- Intercepts the normal boot sequence
+- Skips loading the regular boot image
+- Launches the recovery image instead
+- Boots into TWRP (if installed) or stock recovery
+
+### Expected Output
+
+```bash
+$ ./boot-recovery.sh
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyACM0
+[INFO] Handshake
+[INFO] Sending handshake command: FACTORYM
+[INFO] Device will boot to recovery mode
+```
+
+### Device Behavior
+
+After running this script:
+
+1. Device display shows recovery splash screen
+2. TWRP interface appears (if installed via fastboot-step.sh)
+3. Or stock recovery menu appears (if TWRP not installed)
+4. ADB is available: `adb devices` shows the device
+
+### When to Use
+
+<CardGroup cols={2}>
+  <Card title="Post-Flash" icon="check">
+    Boot into TWRP after flashing it
+  </Card>
+  <Card title="Stuck Device" icon="triangle-exclamation">
+    Force recovery if device is boot looping
+  </Card>
+  <Card title="ADB Access" icon="terminal">
+    Get root shell access via TWRP
+  </Card>
+  <Card title="ROM Installation" icon="download">
+    Boot to TWRP to install custom ROMs
+  </Card>
+</CardGroup>
+
+---
+
+## handshake2.py - Technical Details
+
+### Source Code Analysis
+
+The underlying Python script that both boot scripts use:
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    log("Handshake")
+    dev.handshake2(cmd)
+```
+
+### Command-Line Interface
+
+```bash
+python3 handshake2.py [COMMAND] [PORT]
+```
+
+<ParamField path="COMMAND" type="string" default="FACTFACT">
+  The preloader handshake command to send. Common commands:
+  - `FACTFACT` - Boot to fastboot
+  - `FACTORYM` - Boot to recovery
+</ParamField>
+
+<ParamField path="PORT" type="string" optional>
+  Serial port path (e.g., `/dev/ttyACM0`). If not specified, the script auto-detects the MediaTek device.
+</ParamField>
+
+### Device Detection
+
+The script automatically finds MediaTek devices by:
+
+```python
+if len(sys.argv) > 2:
+    dev = Device(sys.argv[2])  # Use specified port
+else:
+    dev = Device()
+    dev.find_device()  # Auto-detect device
+```
+
+**Auto-detection criteria:**
+- USB Vendor ID: `0E8D` (MediaTek)
+- Serial port available
+- Device responds to serial communication
+
+### Handshake Protocol Details
+
+The handshake process:
+
+1. **Serial Connection**: Opens serial port at 115200 baud
+2. **Command Transmission**: Sends 8-byte command (e.g., `FACTFACT`)
+3. **Preloader Response**: Preloader acknowledges command
+4. **Mode Switch**: Device prepares to boot into requested mode
+5. **Reboot**: Device automatically reboots into the target mode
+
+### Timing
+
+- **Connection timeout**: 5 seconds
+- **Command transmission**: < 100 ms
+- **Device reboot**: 2-5 seconds
+- **Total duration**: ~5-10 seconds
+
+---
+
+## Prerequisites
+
+Both boot scripts require:
+
+<AccordionGroup>
+  <Accordion title="Device Requirements" icon="mobile">
+    - Device must be in preloader mode (achieved via hardware short or after exploit)
+    - Vulnerable preloader must be installed (via bootrom-step.sh)
+    - Device connected via USB cable
+    - Device powered on or in bootrom mode
+  </Accordion>
+  
+  <Accordion title="System Requirements" icon="computer">
+    - Python 3.x installed
+    - pyserial library: `pip3 install pyserial`
+    - ModemManager disabled on Linux
+    - Appropriate USB permissions (udev rules on Linux)
+  </Accordion>
+  
+  <Accordion title="File Requirements" icon="file">
+    - `modules/handshake2.py` present
+    - `modules/common.py` present
+    - `modules/logger.py` present
+  </Accordion>
+</AccordionGroup>
+
+## Error Handling
+
+<Warning>
+Both scripts use `set -e`, meaning they exit immediately on any error.
+</Warning>
+
+### Common Errors
+
+**"Waiting for device" (hangs indefinitely)**
+
+**Cause**: No MediaTek device detected
+
+**Solutions**:
+- Verify device is connected via USB
+- Check device is in preloader or bootrom mode
+- On Linux, verify ModemManager is disabled
+- Check USB cable is data-capable (not charge-only)
+- Try a different USB port
+
+**"Permission denied: /dev/ttyACM0"**
+
+**Cause**: Insufficient permissions to access serial port
+
+**Solutions**:
+- Run with sudo: `sudo ./boot-fastboot.sh`
+- Add user to dialout group: `sudo usermod -a -G dialout $USER`
+- Configure udev rules for MediaTek devices
+- Log out and back in after changing groups
+
+**"Device not responding to handshake"**
+
+**Cause**: Preloader not in correct state or incompatible version
+
+**Solutions**:
+- Verify vulnerable preloader is installed
+- Re-run bootrom-step.sh to install correct preloader
+- Device may need to be power cycled
+- Try using hardware button combination instead
+
+**"Timeout waiting for device"**
+
+**Cause**: Serial communication timeout
+
+**Solutions**:
+- Check USB cable quality
+- Try a different USB port (preferably USB 2.0)
+- Disable USB 3.0 in BIOS if on desktop
+- Verify device is not suspended or in low-power mode
+
+---
+
+## Alternative: Hardware Button Combinations
+
+If the boot scripts fail, you can use hardware buttons:
+
+### Boot to Fastboot (Hardware Method)
+
+1. Power off the device completely
+2. Hold **Volume Down**
+3. Press and hold **Power** while still holding Volume Down
+4. Release buttons when you see the fastboot logo
+
+### Boot to Recovery (Hardware Method)
+
+1. Power off the device completely
+2. Hold **Volume Up**
+3. Press and hold **Power** while still holding Volume Up
+4. Release buttons when you see the recovery logo
+
+<Note>
+Hardware button methods require the vulnerable bootloader to be installed via bootrom-step.sh first.
+</Note>
+
+---
+
+## Use Cases and Workflows
+
+### Development Workflow
+
+```bash
+# Quick cycle for testing boot images
+./boot-fastboot.sh
+fastboot flash boot test-boot.img
+fastboot reboot
+
+# Check boot, then repeat
+./boot-fastboot.sh
+```
+
+### Recovery Workflow
+
+```bash
+# Device won't boot normally
+./boot-recovery.sh
+# In TWRP: wipe cache, fix permissions, restore backup
+```
+
+### ROM Installation Workflow
+
+```bash
+./boot-recovery.sh
+# In TWRP:
+# 1. Backup current system
+# 2. Wipe system, data, cache
+# 3. Install ROM zip from external SD
+# 4. Install GApps
+# 5. Reboot
+```
+
+### Fastboot Flashing Workflow
+
+```bash
+./boot-fastboot.sh
+fastboot flash system system.img
+fastboot flash boot boot.img
+fastboot flash vendor vendor.img
+fastboot reboot
+```
+
+---
+
+## Technical Implementation
+
+### Serial Communication Parameters
+
+- **Baud rate**: 115200
+- **Data bits**: 8
+- **Parity**: None
+- **Stop bits**: 1
+- **Flow control**: None (hardware or software)
+- **Timeout**: 5 seconds
+
+### MediaTek USB Identifiers
+
+- **Vendor ID (VID)**: `0E8D`
+- **Product ID (PID)**: `0003` (bootrom mode)
+- **Product ID (PID)**: Various in preloader mode
+- **Device class**: CDC ACM (Communication Device Class)
+- **Interface**: Serial (ttyACM on Linux, COM on Windows)
+
+### Python Dependencies
+
+From `modules/common.py`:
+
+```python
+import serial
+import serial.tools.list_ports
+```
+
+Required package:
+```bash
+pip3 install pyserial
+```
+
+---
+
+## Related Scripts
+
+<CardGroup cols={3}>
+  <Card title="bootrom-step.sh" icon="microchip" href="/api/bootrom-step">
+    Main exploit script - installs vulnerable preloader
+  </Card>
+  <Card title="fastboot-step.sh" icon="forward" href="/api/fastboot-step">
+    Flash TWRP recovery via fastboot
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/usage/quickstart">
+    Complete exploit walkthrough
+  </Card>
+</CardGroup>
+
+---
+
+## Security Notes
+
+<Warning>
+These scripts rely on the vulnerable preloader installed by bootrom-step.sh. They will not work with stock Amazon firmware.
+</Warning>
+
+- The handshake commands bypass normal boot security
+- No authentication or verification is performed
+- Commands are sent in plaintext over USB
+- This is an intentional backdoor in MediaTek's preloader for factory use
+- Amazon's stock preloader does not have this vulnerability
+- The vulnerable preloader must be explicitly installed via the bootrom exploit
+
+## Advantages Over Hardware Buttons
+
+<CardGroup cols={2}>
+  <Card title="Automation" icon="robot">
+    Can be scripted and integrated into automated workflows
+  </Card>
+  <Card title="Reliability" icon="check">
+    No timing issues with button presses
+  </Card>
+  <Card title="Remote Use" icon="wifi">
+    Can be triggered remotely via SSH or automation tools
+  </Card>
+  <Card title="Convenience" icon="hand">
+    No need to physically press buttons on the device
+  </Card>
+</CardGroup>

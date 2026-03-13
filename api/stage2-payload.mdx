@@ -1,0 +1,580 @@
+---
+title: 'Stage 2 Payload'
+description: 'Second-stage payload with full eMMC access and storage operations'
+icon: 'hard-drive'
+---
+
+## Overview
+
+The Stage 2 payload is loaded by Stage 1 and provides full eMMC access capabilities. It initializes the MMC controller and implements a comprehensive command protocol for reading, writing, and manipulating the device's internal storage.
+
+### Execution Context
+
+- **Load Address**: Loaded to SRAM by Stage 1 (typically `0x00110000`)
+- **Environment**: BROM context with MMC initialized
+- **Capabilities**: Full eMMC access, RPMB operations, partition switching
+- **Dependencies**: Requires Stage 1 to load it into memory
+
+## Initialization
+
+Stage 2 initializes the MMC controller on startup:
+
+**Implementation** (stage2.c:4-14):
+```c
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+
+    struct msdc_host host = { 0 };
+    host.ocr_avail = MSDC_OCR_AVAIL;
+
+    mmc_init(&host);
+
+    command_loop(&host);
+}
+```
+
+### MMC Host Structure
+
+```c
+struct msdc_host host = { 0 };
+host.ocr_avail = MSDC_OCR_AVAIL;  // Operating voltage range
+```
+
+The `msdc_host` structure tracks MMC controller state including current partition, card capabilities, and transfer status.
+
+## Command Protocol
+
+Stage 2 uses the same protocol as Stage 1 with expanded command set:
+
+1. Magic header: `0xf00dd00d` (32-bit)
+2. Command code: (32-bit)
+3. Command-specific parameters
+
+### Handshake Sequence
+
+```c
+// Stage 2 sends ready signal after MMC initialization
+send_dword(0xB1B2B3B4);
+
+// Enter command loop
+while (1) {
+    uint32_t magic = recv_dword();
+    if (magic != 0xf00dd00d) {
+        printf("Protocol error\n");
+        break;
+    }
+    uint32_t cmd = recv_dword();
+    // Process command...
+}
+```
+
+<Note>
+Stage 2 ready signal is `0xB1B2B3B4` (different from Stage 1's `0xA1A2A3A4`)
+</Note>
+
+## Command Reference
+
+### 0x1000: Read Block
+
+Reads a 512-byte block from the current eMMC partition.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x1000
+Block:   <block_number> (uint32_t)
+```
+
+**Response**:
+- 512 bytes of block data
+
+**Implementation** (payload_common.c:61-70):
+```c
+case 0x1000: {
+    uint32_t block = recv_dword();
+    printf("Read block 0x%08X\n", block);
+    memset(buf, 0, sizeof(buf));
+    if (mmc_read(host, block, buf) != 0) {
+        printf("Read error!\n");
+    } else {
+        send_data(buf, sizeof(buf));  // Send 0x200 bytes
+    }
+    break;
+}
+```
+
+**Use Cases**:
+- Dumping partition contents
+- Reading GPT/partition tables
+- Extracting boot images, firmware
+- Forensic analysis
+
+---
+
+### 0x1001: Write Block
+
+Writes a 512-byte block to the current eMMC partition.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x1001
+Block:   <block_number> (uint32_t)
+Data:    <512 bytes to write>
+```
+
+**Response**:
+- Success: `0xD0D0D0D0`
+
+**Implementation** (payload_common.c:72-83):
+```c
+case 0x1001: {
+    uint32_t block = recv_dword();
+    printf("Write block 0x%08X ", block);
+    memset(buf, 0, sizeof(buf));
+    recv_data(buf, 0x200, 0);
+    if (mmc_write(host, block, buf) != 0) {
+        printf("Write error!\n");
+    } else {
+        printf("OK\n");
+        send_dword(0xD0D0D0D0);
+    }
+    break;
+}
+```
+
+**Use Cases**:
+- Flashing partitions
+- Patching boot images
+- Installing custom recovery/bootloader
+- Modifying device configuration
+
+<Warning>
+Writing to wrong blocks can brick the device. Always verify block addresses before writing.
+</Warning>
+
+---
+
+### 0x1002: Switch Partition
+
+Switches the active eMMC partition for subsequent read/write operations.
+
+**Protocol**:
+```
+Magic:    0xf00dd00d
+Command:  0x1002
+Partition: <partition_id> (uint32_t)
+```
+
+**Partition IDs**:
+- `0`: User partition (main storage)
+- `1`: Boot0 partition (bootloader)
+- `2`: Boot1 partition (backup/IDME)
+- `8`: User partition (alternate ID)
+
+**Implementation** (payload_common.c:85-91):
+```c
+case 0x1002: {
+    uint32_t part = recv_dword();
+    printf("Switch to partition %d => ", part);
+    ret = mmc_set_part(host, part);
+    printf("0x%08X\n", ret);
+    mdelay(500); // Delay for partition switch to complete
+    break;
+}
+```
+
+**Use Cases**:
+- Accessing bootloader in Boot0/Boot1
+- Reading IDME data from Boot1
+- Dumping/restoring all partitions
+
+<Note>
+A 500ms delay is inserted after partition switch to ensure the hardware completes the operation.
+</Note>
+
+---
+
+### 0x2000: Read RPMB
+
+Reads 256 bytes from the Replay Protected Memory Block (RPMB) partition.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x2000
+```
+
+**Response**:
+- 256 bytes (0x100) of RPMB data
+
+**Implementation** (payload_common.c:93-97):
+```c
+case 0x2000: {
+    printf("Read rpmb\n");
+    mmc_rpmb_read(host, buf);
+    send_data(buf, 0x100);
+    break;
+}
+```
+
+**RPMB Overview**:
+- Secure storage partition with authentication
+- Used for device keys, DRM, security tokens
+- Read/write requires authenticated frames
+
+---
+
+### 0x2001: Write RPMB
+
+Writes 256 bytes to the RPMB partition.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x2001
+Data:    <256 bytes to write>
+```
+
+**Implementation** (payload_common.c:99-103):
+```c
+case 0x2001: {
+    printf("Write rpmb\n");
+    recv_data(buf, 0x100, 0);
+    mmc_rpmb_write(host, buf);
+    break;
+}
+```
+
+<Warning>
+RPMB operations require properly formatted and authenticated frames. Incorrect writes can permanently lock the RPMB partition.
+</Warning>
+
+---
+
+### 0x5000: Read Memory
+
+Reads arbitrary memory from the device's address space.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x5000
+Address: <memory_address> (uint32_t)
+Size:    <byte_count> (uint32_t)
+```
+
+**Response**:
+- `<size>` bytes of memory contents
+
+**Implementation** (payload_common.c:105-110):
+```c
+case 0x5000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    printf("Read %d Bytes from address 0x%08X\n", size, address);
+    send_data((char*)address, size);
+    break;
+}
+```
+
+**Use Cases**:
+- Dumping BROM code
+- Reading hardware registers
+- Extracting secrets from memory
+- Firmware analysis
+
+---
+
+### 0x7000: Read IDME Field
+
+Reads a specific field from Amazon's IDME (ID ME) partition.
+
+**Protocol**:
+```
+Magic:      0xf00dd00d
+Command:    0x7000
+Field_Name: <16 bytes, null-padded field name>
+```
+
+**Response**:
+- Field length (uint32_t)
+- Field data (variable length)
+
+**Implementation** (payload_common.c:112-172):
+```c
+case 0x7000: {
+    char idme_buf[0x400] = { 0 };
+    char field_name[16] = { 0 };
+    const char beefdeed[] = "beefdeed";
+    uint32_t result = 0;
+    recv_data(field_name, 16, 0);
+    printf("Read %s from IDME\n", field_name);
+    
+    // Switch to Boot1 partition (IDME location)
+    printf("Switch to partition %d => ", 2);
+    ret = mmc_set_part(host, 2);
+    printf("0x%08X\n", ret);
+    mdelay(500);
+    
+    uint32_t block = 0;
+    void *type_offset = 0;
+    
+    // Search for field in IDME
+    while (!(type_offset = memmem(idme_buf, 0x400, &field_name, 16)) 
+           && block < 0x2000) {
+        if (mmc_read(host, block++, buf) != 0) {
+            result = 0xffffffff;  // Read error
+            break;
+        }
+        // Validate IDME header on first block
+        if (block == 1 && memcmp(buf, &beefdeed, 8)) {
+            result = 0xbeefdeed;  // Invalid IDME
+            break;
+        }
+        // Sliding window search
+        memcpy(idme_buf, idme_buf + 0x200, 0x200);
+        memcpy(idme_buf + 0x200, buf, 0x200);
+    }
+    
+    if (type_offset) {
+        uint32_t len = *(uint32_t*)(type_offset + 16);
+        type_offset += 16 + 12;  // Skip to data
+        send_dword(len);
+        send_data(type_offset, len);
+    } else if (!result) {
+        result = 0xdeadbeef;  // Field not found
+    }
+    
+    if (result) {
+        send_dword(4);
+        send_dword(result);  // Error code
+    }
+    break;
+}
+```
+
+**IDME Structure**:
+- Located in Boot1 partition
+- Header magic: `beefdeed`
+- Fields: 16-byte name + 4-byte length + data
+
+**Common Fields**:
+- `serial` - Device serial number
+- `mac_addr` - WiFi MAC address
+- `board_id` - Hardware board ID
+- `bootcount` - Boot counter
+
+**Error Codes**:
+- `0xbeefdeed` - Invalid IDME partition
+- `0xdeadbeef` - Field not found
+- `0xffffffff` - Read error
+
+---
+
+### 0x3000: Reboot Device
+
+Performs hardware reset (same as Stage 1).
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x3000
+```
+
+**Implementation** (payload_common.c:173-182):
+```c
+case 0x3000: {
+    printf("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    reg[0/4] = 0x22000014;
+    reg[0x14/4] = 0x1209;
+    while (1) {}
+}
+```
+
+---
+
+### 0x3001: Kick Watchdog
+
+Resets watchdog timer (same as Stage 1).
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x3001
+```
+
+**Implementation** (payload_common.c:184-188):
+```c
+case 0x3001: {
+    printf("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    break;
+}
+```
+
+## eMMC Partition Layout
+
+Stage 2 can access all eMMC partitions:
+
+### User Partition (ID: 0 or 8)
+```
+- GPT Header (block 1)
+- boot      - Android boot image
+- recovery  - Recovery image
+- system    - Android system
+- userdata  - User data
+- cache     - Cache
+- MISC      - Boot mode flags
+- lk        - LK bootloader
+```
+
+### Boot0 Partition (ID: 1)
+```
+- Preloader (0x0 - 0x80000)
+- LK Payload (0x80000 - 0x100000)
+- Backup LK Payload (0x200000)
+```
+
+### Boot1 Partition (ID: 2)
+```
+- IDME data (Amazon device info)
+- Device-specific configuration
+```
+
+## Usage Example
+
+```python
+import struct
+
+def send_command(magic, cmd):
+    device.write(struct.pack('<II', magic, cmd))
+
+def stage2_read_block(block_num):
+    """Read 512-byte block from eMMC"""
+    send_command(0xf00dd00d, 0x1000)
+    device.write(struct.pack('<I', block_num))
+    return device.read(512)
+
+def stage2_switch_partition(part_id):
+    """Switch active partition"""
+    send_command(0xf00dd00d, 0x1002)
+    device.write(struct.pack('<I', part_id))
+    time.sleep(0.5)  # Wait for switch
+
+def stage2_read_idme(field_name):
+    """Read IDME field"""
+    send_command(0xf00dd00d, 0x7000)
+    device.write(field_name.encode().ljust(16, b'\x00'))
+    length = struct.unpack('<I', device.read(4))[0]
+    if length <= 4:  # Error code
+        return None
+    return device.read(length)
+
+# Wait for Stage 2 ready signal
+ready = struct.unpack('<I', device.read(4))[0]
+assert ready == 0xB1B2B3B4
+
+# Dump Boot0 partition
+stage2_switch_partition(1)
+with open('boot0.bin', 'wb') as f:
+    for block in range(0x2000):  # 4MB
+        data = stage2_read_block(block)
+        f.write(data)
+
+# Read device serial
+serial = stage2_read_idme('serial')
+print(f'Device Serial: {serial.decode()}')
+```
+
+## Debug Output
+
+Stage 2 provides verbose UART logging:
+
+```
+Entered 2ND stage payload
+Copyright xyz, k4y0z 2019
+Entering command loop
+Read block 0x00000001
+Switch to partition 1 => 0x00000000
+Read serial from IDME
+```
+
+## Error Handling
+
+### Protocol Errors
+```c
+if (magic != 0xf00dd00d) {
+    printf("Protocol error\n");
+    printf("Magic received = 0x%08X\n", magic);
+    break;
+}
+```
+
+### MMC Errors
+```c
+if (mmc_read(host, block, buf) != 0) {
+    printf("Read error!\n");
+}
+```
+
+## Memory Buffer
+
+Stage 2 uses a 512-byte buffer for all operations:
+
+```c
+char buf[0x200] = { 0 };  // 512 bytes
+memset(buf, 0, sizeof(buf));  // Clear before each operation
+```
+
+## Utility Functions
+
+### Hex Dump (payload_common.c:22-41)
+
+```c
+void hex_dump(const void* data, size_t size) {
+    size_t i, j;
+    for (i = 0; i < size; ++i) {
+        printf("%02X ", ((unsigned char*)data)[i]);
+        if ((i+1) % 8 == 0 || i+1 == size) {
+            printf(" ");
+            if ((i+1) % 16 == 0) {
+                printf("\n");
+            }
+        }
+    }
+}
+```
+
+### Delays (payload_common.c:4-20)
+
+```c
+void mdelay(unsigned long msec) {
+    for (volatile int i = 0; i < 0x80000; ++i) {}
+}
+
+void udelay(unsigned long usec) {
+    for (volatile int i = 0; i < 0x80000; ++i) {}
+}
+```
+
+<Note>
+Delay implementations are approximate busy-loops, not precise timers.
+</Note>
+
+## Source Reference
+
+Full implementation:
+- `brom-payload/stage2.c` - Main entry point
+- `brom-payload/payload_common.c` - Command loop
+- `brom-payload/drivers/mmc.c` - MMC driver
+
+## Next Steps
+
+After Stage 2 operations complete:
+- Use [LK Payload](/api/lk-payload) for persistent boot modifications
+- See [Usage Guide](/usage/quickstart) for practical examples

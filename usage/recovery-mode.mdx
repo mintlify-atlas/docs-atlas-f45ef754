@@ -1,0 +1,786 @@
+---
+title: "Recovery Mode"
+description: "Using TWRP recovery for system modifications and advanced device management"
+---
+
+# Recovery Mode
+
+After successfully exploiting your device and flashing TWRP (Team Win Recovery Project), you gain access to a powerful recovery environment for system modifications, ROM flashing, backups, and advanced file management.
+
+<Info>
+  **TWRP Installation**: Recovery mode access requires first flashing TWRP using the fastboot-step script after successful bootrom exploitation.
+</Info>
+
+## Installing TWRP Recovery
+
+TWRP is installed as part of the standard Kamakiri exploitation workflow:
+
+<Steps>
+  <Step title="Run Bootrom Exploit">
+    ```bash
+    ./bootrom-step.sh
+    ```
+
+    This unlocks the bootloader and boots into fastboot mode.
+  </Step>
+
+  <Step title="Flash TWRP">
+    ```bash
+    ./fastboot-step.sh
+    ```
+
+    **Script contents**:
+    ```bash
+    #!/bin/bash
+    set -e
+    
+    fastboot flash recovery bin/twrp.img
+    fastboot oem reboot-recovery
+    
+    echo ""
+    echo "Your device will now reboot into TWRP."
+    echo ""
+    ```
+
+    Expected output:
+    ```
+    Sending 'recovery' (16384 KB)                      OKAY [  0.523s]
+    Writing 'recovery'                                 OKAY [  0.234s]
+    Finished. Total time: 0.812s
+    
+    Your device will now reboot into TWRP.
+    ```
+  </Step>
+
+  <Step title="First Boot into TWRP">
+    The device automatically reboots into TWRP recovery. You'll see the TWRP interface on your TV screen.
+  </Step>
+</Steps>
+
+## Entering Recovery Mode
+
+### Automatic Entry
+
+After running `fastboot-step.sh`, the device automatically boots into recovery:
+
+```bash
+fastboot oem reboot-recovery
+```
+
+This is the OEM command used by the script to trigger recovery mode.
+
+### Manual Entry (From Preloader)
+
+To manually boot into recovery mode from preloader:
+
+```bash
+./boot-recovery.sh
+```
+
+**Script contents**:
+```bash
+#!/bin/bash
+set -e
+cd modules
+python3 handshake2.py FACTORYM
+cd ..
+```
+
+This sends the `FACTORYM` command to the preloader:
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    c = 0
+    while c != b'Y':
+        c = dev.read()
+    log("Preloader ready, sending " + cmd)
+    command = str.encode(cmd)
+    dev.write(command)
+    dev.flushInput()
+```
+
+The preloader interprets `FACTORYM` as a command to boot into recovery mode.
+
+<Note>
+  **Preloader Mode Required**: `boot-recovery.sh` only works when the device is in preloader mode. From fastboot, use `fastboot oem reboot-recovery` instead.
+</Note>
+
+### Entry from Fastboot
+
+If already in fastboot mode:
+
+```bash
+fastboot oem reboot-recovery
+# OR
+fastboot reboot-recovery
+```
+
+### Persistent Recovery Boot
+
+To configure the device to always boot into recovery, write a flag to the MISC partition:
+
+```python
+def force_recovery(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "boot-recovery\x00\x00\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+```
+
+This makes recovery mode persistent until the flag is cleared.
+
+## TWRP Interface Navigation
+
+<Warning>
+  **Remote Control**: On Fire TV Stick, you navigate TWRP using the Fire TV remote. The interface is designed for touch screens, so navigation may feel unintuitive.
+</Warning>
+
+### Remote Button Mapping
+
+| Fire TV Remote | TWRP Action |
+|----------------|-------------|
+| D-Pad Up/Down/Left/Right | Move cursor |
+| Select (Center) | Click/Select |
+| Back | Back/Cancel |
+| Home | No effect |
+| Menu | No effect |
+
+<Tip>
+  **USB Mouse**: For easier navigation, connect a USB mouse via OTG adapter. This provides much better control than the remote.
+</Tip>
+
+## TWRP Features
+
+### Main Menu
+
+The TWRP main screen shows several options:
+
+<Tabs>
+  <Tab title="Install">
+    Flash ZIP files (ROMs, mods, Magisk, etc.)
+
+    **Common uses**:
+    - Install custom ROMs
+    - Flash Magisk for root access
+    - Install Xposed Framework
+    - Apply system modifications
+    - Flash GApps (Google Apps)
+
+    **Usage**:
+    1. Navigate to **Install**
+    2. Browse to your ZIP file
+    3. Swipe to confirm flash
+    4. Wait for completion
+    5. Reboot or return to main menu
+  </Tab>
+
+  <Tab title="Wipe">
+    Erase partitions and perform factory reset
+
+    **Options**:
+    - **Wipe cache/dalvik**: Safe, clears cached data
+    - **Factory Reset**: Erases data and cache
+    - **Advanced Wipe**: Select specific partitions
+    - **Format Data**: Complete data wipe (removes encryption)
+
+    <Warning>
+      **Format Data** will erase all user data and cannot be undone. Always backup first.
+    </Warning>
+  </Tab>
+
+  <Tab title="Backup">
+    Create full or partial backups of your device
+
+    **What to backup**:
+    - ✅ Boot (kernel)
+    - ✅ System (OS)
+    - ✅ Data (user data)
+    - ❌ Cache (not needed)
+    - ⚠️ Recovery (optional)
+
+    **Backup location**:
+    - Internal storage: `/sdcard/TWRP/BACKUPS/`
+    - External storage: USB OTG or network
+
+    <Tip>
+      Always create a backup before flashing ROMs or making major changes.
+    </Tip>
+  </Tab>
+
+  <Tab title="Restore">
+    Restore previously created backups
+
+    **Process**:
+    1. Select backup to restore
+    2. Choose partitions to restore
+    3. Swipe to confirm
+    4. Wait for completion
+    5. Reboot
+
+    <Note>
+      You can selectively restore partitions. For example, restore only System while keeping Data intact.
+    </Note>
+  </Tab>
+
+  <Tab title="Mount">
+    Mount/unmount partitions for access
+
+    **Options**:
+    - System
+    - Data
+    - Cache
+    - USB Storage
+    - MicroSD Card
+
+    Mounting enables:
+    - File access via ADB
+    - File browser operations
+    - USB mass storage mode
+  </Tab>
+
+  <Tab title="Settings">
+    Configure TWRP behavior
+
+    **Important settings**:
+    - **ZIP signature verification**: Off (for unsigned ZIPs)
+    - **Mount system read-only**: Off (for modifications)
+    - **Prompt to install TWRP app**: Personal preference
+    - **Time Zone**: Set correct timezone for backups
+  </Tab>
+
+  <Tab title="Advanced">
+    Advanced tools and operations
+
+    **Features**:
+    - **File Manager**: Browse and edit files
+    - **Terminal**: Run shell commands
+    - **Copy Log**: Save TWRP log for debugging
+    - **ADB Sideload**: Install ZIPs via ADB
+    - **Fix Permissions**: Repair file permissions
+    - **Partition SD Card**: Format external storage
+  </Tab>
+
+  <Tab title="Reboot">
+    Reboot to various modes
+
+    **Options**:
+    - **System**: Normal Android boot
+    - **Recovery**: Restart TWRP
+    - **Bootloader**: Enter fastboot mode
+    - **Power Off**: Shut down device
+  </Tab>
+</Tabs>
+
+## Common TWRP Operations
+
+### Installing Magisk (Root Access)
+
+<Steps>
+  <Step title="Download Magisk">
+    Download the latest Magisk ZIP from [GitHub](https://github.com/topjohnwu/Magisk/releases):
+    - File: `Magisk-v26.1.zip` (or latest version)
+
+    Transfer to device via ADB:
+    ```bash
+    adb push Magisk-v26.1.zip /sdcard/
+    ```
+  </Step>
+
+  <Step title="Boot into TWRP">
+    ```bash
+    ./boot-recovery.sh
+    # OR from fastboot
+    fastboot oem reboot-recovery
+    ```
+  </Step>
+
+  <Step title="Flash Magisk">
+    1. In TWRP, tap **Install**
+    2. Navigate to `/sdcard/`
+    3. Select `Magisk-v26.1.zip`
+    4. Swipe to confirm flash
+    5. Wait for "Successful" message
+    6. Tap **Reboot System**
+  </Step>
+
+  <Step title="Verify Root">
+    After reboot, verify Magisk is installed:
+    ```bash
+    adb shell
+    su
+    # Should grant root access
+    ```
+  </Step>
+</Steps>
+
+### Creating a Full Backup
+
+<Steps>
+  <Step title="Boot into TWRP">
+    ```bash
+    fastboot oem reboot-recovery
+    ```
+  </Step>
+
+  <Step title="Select Backup">
+    1. Tap **Backup** on main menu
+    2. Select partitions:
+       - ✅ Boot
+       - ✅ System  
+       - ✅ Data
+       - ❌ Cache (optional)
+    3. Optionally change backup name
+  </Step>
+
+  <Step title="Choose Storage Location">
+    - **Internal Storage**: On device storage
+    - **MicroSD Card**: External SD (if available)
+    - **USB OTG**: USB flash drive
+  </Step>
+
+  <Step title="Start Backup">
+    1. Swipe to start backup
+    2. Wait for completion (5-30 minutes depending on size)
+    3. Verify "Backup Complete" message
+  </Step>
+
+  <Step title="Copy Backup Off-Device">
+    ```bash
+    adb pull /sdcard/TWRP/BACKUPS/ ./device-backup/
+    ```
+
+    <Warning>
+      Store backups on a separate device. If the device is bricked, you can't access internal storage.
+    </Warning>
+  </Step>
+</Steps>
+
+### Flashing a Custom ROM
+
+<Steps>
+  <Step title="Prepare ROM Files">
+    Download:
+    - Custom ROM ZIP
+    - GApps package (if ROM doesn't include Google apps)
+    - Magisk ZIP (for root)
+
+    Transfer to device:
+    ```bash
+    adb push lineage-*.zip /sdcard/
+    adb push gapps-*.zip /sdcard/
+    adb push Magisk-*.zip /sdcard/
+    ```
+  </Step>
+
+  <Step title="Backup Current System">
+    Always backup before flashing!
+    1. TWRP → **Backup**
+    2. Select Boot + System + Data
+    3. Swipe to backup
+  </Step>
+
+  <Step title="Wipe for Clean Install">
+    1. TWRP → **Wipe**
+    2. Select **Advanced Wipe**
+    3. Check:
+       - ✅ Dalvik / ART Cache
+       - ✅ System
+       - ✅ Data
+       - ✅ Cache
+       - ❌ Internal Storage (keep your ZIPs!)
+    4. Swipe to wipe
+  </Step>
+
+  <Step title="Flash ROM">
+    1. TWRP → **Install**
+    2. Select ROM ZIP
+    3. Swipe to flash
+    4. Wait for completion
+  </Step>
+
+  <Step title="Flash GApps and Magisk">
+    Without returning to main menu:
+    1. Tap **Install Zip** button
+    2. Select GApps ZIP
+    3. Add to queue
+    4. Select Magisk ZIP  
+    5. Add to queue
+    6. Swipe to flash all
+  </Step>
+
+  <Step title="Reboot and Enjoy">
+    1. Tap **Reboot System**
+    2. First boot takes 5-15 minutes
+    3. Complete Android setup
+  </Step>
+</Steps>
+
+### Using ADB in Recovery
+
+TWRP supports ADB for file operations and sideloading.
+
+<Tabs>
+  <Tab title="File Operations">
+    **Push files to device**:
+    ```bash
+    adb push file.zip /sdcard/
+    adb push folder/ /sdcard/folder/
+    ```
+
+    **Pull files from device**:
+    ```bash
+    adb pull /sdcard/TWRP/BACKUPS/ ./backup/
+    adb pull /data/media/0/Download/ ./downloads/
+    ```
+
+    **List files**:
+    ```bash
+    adb shell ls /sdcard/
+    adb shell ls -la /data/
+    ```
+
+    **Delete files**:
+    ```bash
+    adb shell rm /sdcard/old-rom.zip
+    adb shell rm -rf /sdcard/old-folder/
+    ```
+  </Tab>
+
+  <Tab title="ADB Sideload">
+    Install ZIPs without first transferring them:
+
+    1. In TWRP, go to **Advanced** → **ADB Sideload**
+    2. Swipe to start sideload
+    3. On computer:
+       ```bash
+       adb sideload rom.zip
+       ```
+
+    This streams the ZIP directly to TWRP without copying to storage.
+
+    <Tip>
+      Useful when internal storage is full or corrupted.
+    </Tip>
+  </Tab>
+
+  <Tab title="Shell Access">
+    Access TWRP terminal:
+    ```bash
+    adb shell
+    ```
+
+    Common commands:
+    ```bash
+    # Mount system
+    mount /system
+    
+    # Edit files
+    vi /system/build.prop
+    
+    # Fix permissions
+    chmod 644 /system/build.prop
+    chown root:root /system/build.prop
+    
+    # Free space
+    df -h
+    
+    # Process list
+    ps
+    ```
+  </Tab>
+
+  <Tab title="View Logs">
+    ```bash
+    # View recovery log
+    adb shell cat /tmp/recovery.log
+    
+    # View kernel log
+    adb shell dmesg
+    
+    # Save logs locally
+    adb pull /tmp/recovery.log ./twrp.log
+    ```
+  </Tab>
+</Tabs>
+
+## TWRP File Manager
+
+TWRP includes a built-in file manager for manual file operations.
+
+### Accessing File Manager
+
+1. TWRP → **Advanced** → **File Manager**
+2. Navigate using directory list
+3. Select files/folders for operations
+
+### File Operations
+
+<AccordionGroup>
+  <Accordion title="Copy/Move Files" icon="copy">
+    1. Navigate to source file
+    2. Tap and hold file
+    3. Select **Copy** or **Move**
+    4. Navigate to destination
+    5. Tap **Paste**
+  </Accordion>
+
+  <Accordion title="Delete Files" icon="trash">
+    1. Navigate to file
+    2. Tap and hold file
+    3. Select **Delete**
+    4. Confirm deletion
+    
+    <Warning>
+      Deletion is permanent and cannot be undone.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Change Permissions" icon="lock">
+    1. Navigate to file
+    2. Tap and hold file
+    3. Select **Chmod** (Change Permissions)
+    4. Set permissions (e.g., 644, 755)
+    5. Confirm
+
+    Common permissions:
+    - `644`: rw-r--r-- (readable files)
+    - `755`: rwxr-xr-x (executable files)
+    - `777`: rwxrwxrwx (fully accessible)
+  </Accordion>
+
+  <Accordion title="Rename Files" icon="pen">
+    1. Navigate to file
+    2. Tap and hold file
+    3. Select **Rename**
+    4. Enter new name
+    5. Confirm
+  </Accordion>
+</AccordionGroup>
+
+### Important Directories
+
+| Path | Description |
+|------|-------------|
+| `/sdcard/` | Internal storage (user accessible) |
+| `/sdcard/TWRP/` | TWRP data (backups, logs) |
+| `/system/` | System partition (OS files) |
+| `/data/` | User data partition |
+| `/data/app/` | Installed applications |
+| `/data/data/` | App data |
+| `/cache/` | System cache |
+| `/boot/` | Boot partition (not directly accessible) |
+| `/tmp/` | Temporary files and logs |
+
+## Advanced Recovery Operations
+
+### Fix Bootloop
+
+If the device is stuck in a boot loop:
+
+<Steps>
+  <Step title="Enter Recovery">
+    ```bash
+    ./boot-recovery.sh
+    # OR
+    fastboot oem reboot-recovery
+    ```
+  </Step>
+
+  <Step title="Try Wipe Cache">
+    1. TWRP → **Wipe**
+    2. Select **Dalvik / ART Cache** and **Cache**
+    3. Swipe to wipe
+    4. Reboot
+
+    This often fixes bootloops after ROM updates.
+  </Step>
+
+  <Step title="If Still Bootlooping">
+    Restore from backup:
+    1. TWRP → **Restore**
+    2. Select backup
+    3. Choose partitions to restore
+    4. Swipe to restore
+    5. Reboot
+  </Step>
+
+  <Step title="Last Resort: Factory Reset">
+    1. TWRP → **Wipe**
+    2. Select **Factory Reset**
+    3. Swipe to wipe
+    4. Reinstall ROM
+  </Step>
+</Steps>
+
+### Repair Corrupted System
+
+```bash
+# Enter shell
+adb shell
+
+# Mount system
+mount /system
+
+# Check filesystem
+e2fsck -fy /dev/block/platform/*/by-name/system
+
+# Remount
+umount /system
+mount /system
+```
+
+### Fix Permissions Issues
+
+1. TWRP → **Advanced** → **Fix Permissions**
+2. Swipe to fix
+3. Reboot
+
+This repairs file ownership and permissions in `/system/` and `/data/`.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="TWRP won't boot" icon="circle-exclamation">
+    **Problem**: Device doesn't enter TWRP or shows error.
+
+    **Solutions**:
+    1. Re-flash TWRP:
+       ```bash
+       fastboot flash recovery twrp.img
+       fastboot oem reboot-recovery
+       ```
+
+    2. Verify TWRP image is not corrupted:
+       ```bash
+       md5sum bin/twrp.img
+       ```
+
+    3. Try different TWRP version
+
+    4. Check recovery partition size:
+       ```bash
+       fastboot getvar partition-size:recovery
+       ```
+  </Accordion>
+
+  <Accordion title="Touch screen not working" icon="hand-pointer">
+    **Problem**: Cannot navigate TWRP with remote.
+
+    **Solutions**:
+    1. Connect USB mouse via OTG adapter
+    2. Use ADB for operations:
+       ```bash
+       adb shell twrp install /sdcard/rom.zip
+       ```
+    3. Try different TWRP build with better input support
+  </Accordion>
+
+  <Accordion title="Cannot mount /system" icon="mount">
+    **Problem**: "Failed to mount /system" error.
+
+    **Solutions**:
+    1. Try mounting manually:
+       ```bash
+       adb shell
+       mount -t ext4 /dev/block/platform/*/by-name/system /system
+       ```
+
+    2. Check filesystem:
+       ```bash
+       e2fsck -fy /dev/block/platform/*/by-name/system
+       ```
+
+    3. Wipe and reflash system partition
+  </Accordion>
+
+  <Accordion title="ADB not working in recovery" icon="usb">
+    **Problem**: `adb devices` shows nothing in TWRP.
+
+    **Solutions**:
+    1. Re-enable ADB in TWRP:
+       - TWRP → **Mount** → Enable MTP
+
+    2. Install proper drivers on Windows
+
+    3. Try different USB cable/port
+
+    4. On Linux, check udev rules
+  </Accordion>
+
+  <Accordion title="Backup fails with error" icon="database">
+    **Problem**: Backup aborts with I/O error.
+
+    **Solutions**:
+    1. Free up space:
+       ```bash
+       adb shell df -h
+       ```
+
+    2. Backup to external storage (USB OTG)
+
+    3. Backup partitions individually
+
+    4. Check storage health:
+       ```bash
+       adb shell dmesg | grep mmc
+       ```
+  </Accordion>
+
+  <Accordion title="Installation failed" icon="circle-xmark">
+    **Problem**: ZIP installation fails with status 1 or 7.
+
+    **Status 1**: General error
+    - Check ZIP integrity
+    - Verify ZIP is for correct device
+    - Review installation log
+
+    **Status 7**: Signature verification failed  
+    - Disable signature verification:
+      TWRP → **Settings** → Uncheck **ZIP signature verification**
+
+    **Status 255**: Script error
+    - Check `/tmp/recovery.log` for details
+    - ZIP may be incompatible
+  </Accordion>
+</AccordionGroup>
+
+## Alternative: boot-recovery.sh Internals
+
+The recovery boot script uses the same handshake mechanism as fastboot:
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    # Wait for preloader ready signal
+    c = 0
+    while c != b'Y':
+        c = dev.read()
+    log("Preloader ready, sending " + cmd)
+    
+    # Send command
+    command = str.encode(cmd)
+    dev.write(command)
+    dev.flushInput()
+```
+
+**Commands**:
+- `FACTFACT`: Boot to fastboot
+- `FACTORYM`: Boot to recovery
+
+The modified preloader recognizes these commands and redirects boot accordingly.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Bootrom Exploit" icon="microchip" href="/usage/bootrom-exploit">
+    Understand the exploitation process
+  </Card>
+  <Card title="Fastboot Mode" icon="bolt" href="/usage/fastboot-mode">
+    Fastboot commands and operations
+  </Card>
+  <Card title="eMMC Operations" icon="database" href="/advanced/emmc-operations">
+    Direct storage manipulation
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Advanced troubleshooting guide
+  </Card>
+</CardGroup>

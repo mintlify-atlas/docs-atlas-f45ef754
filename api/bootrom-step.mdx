@@ -1,0 +1,242 @@
+---
+title: 'bootrom-step.sh'
+description: 'Main exploit script that performs the bootrom exploit and installs downgraded firmware'
+---
+
+## Overview
+
+`bootrom-step.sh` is the primary exploit script that triggers the MediaTek bootrom vulnerability and performs the complete downgrade process. It wraps the Python-based exploit in `modules/main.py` to make critical system modifications.
+
+## Usage
+
+```bash
+./bootrom-step.sh [fixgpt] [crash]
+```
+
+## Arguments
+
+<ParamField path="fixgpt" type="string" optional>
+  Repairs the GPT (GUID Partition Table) by flashing `gpt-mantis.bin` to the device before performing other operations. Use this if your device has a corrupted partition table.
+</ParamField>
+
+<ParamField path="crash" type="string" optional>
+  Forces the device to crash out of preloader mode if detected. Can be used alone or combined with `fixgpt` (e.g., `./bootrom-step.sh fixgpt crash`). The script will repeatedly attempt to crash the preloader until the device enters bootrom mode.
+</ParamField>
+
+## What It Does
+
+The script performs the following operations step-by-step:
+
+### 1. Device Detection and Mode Check
+
+```bash
+cd modules
+python3 main.py $@
+cd ..
+```
+
+The script:
+- Waits for a MediaTek device to be connected (VID: 0E8D)
+- Detects whether the device is in bootrom or preloader mode
+- If `crash` argument is provided and device is in preloader, repeatedly crashes it until bootrom mode is reached
+
+### 2. Payload Loading
+
+Based on device mode:
+- **Bootrom mode**: Loads the main bootrom exploit payload
+- **Preloader mode**: Loads the preloader-specific payload
+
+### 3. Device Verification
+
+Reads the device type ID from IDME partition:
+
+```python
+device_type_id = dev.idme_read(b"device_type_id")
+```
+
+Expected device: **mantis** (AKPGW064GI9HE)
+
+If the wrong device is detected, the script exits with error code 1.
+
+### 4. GPT Repair (Optional)
+
+If `fixgpt` argument is provided:
+
+```python
+dev.emmc_switch(0)
+flash_binary(dev, "../bin/gpt-mantis.bin", 0, 34 * 0x200)
+```
+
+Flashes the correct GPT to the first 34 sectors (17KB) of the eMMC.
+
+### 5. GPT Validation
+
+Verifies the partition table contains required partitions:
+- `lk` (Little Kernel bootloader)
+- `tee1` (Trusted Execution Environment)
+- `boot` (Boot partition)
+- `recovery` (Recovery partition)
+
+If any partition is missing, the script fails with "bad gpt" error.
+
+### 6. Boot0 Partition Check
+
+Switches to boot0 hardware partition and validates:
+
+```python
+dev.emmc_switch(1)
+block = dev.emmc_read(0)
+```
+
+Expects either:
+- Header starting with `EMMC_BOOT`
+- All zeros (empty partition)
+
+### 7. RPMB Downgrade
+
+The critical anti-rollback bypass:
+
+```python
+rpmb = dev.rpmb_read()
+if rpmb[0:4] != b"AMZN":
+    # Prompt user to confirm if RPMB already broken
+dev.rpmb_write(b"\x00" * 0x100)
+```
+
+Zeros out the Replay Protected Memory Block (RPMB) to enable firmware downgrade. If RPMB doesn't start with "AMZN" signature, prompts the user to confirm (indicates exploit already run).
+
+### 8. TrustZone Downgrade
+
+```python
+flash_binary(dev, "../bin/tz.img", gpt["tee1"][0], gpt["tee1"][1] * 0x200)
+```
+
+Flashes vulnerable TrustZone firmware to the `tee1` partition.
+
+### 9. Little Kernel (LK) Downgrade
+
+```python
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+```
+
+Installs vulnerable bootloader to the `lk` partition.
+
+### 10. LK-Payload Installation
+
+```python
+switch_boot0(dev)
+flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+```
+
+Flashes the custom LK payload to boot0 at offset 1024 sectors. This payload persists across reboots.
+
+### 11. Microloader Injection
+
+```python
+boot_hdr1 = dev.emmc_read(gpt["boot"][0]) + dev.emmc_read(gpt["boot"][0] + 1)
+boot_hdr2 = dev.emmc_read(gpt["boot"][0] + 2) + dev.emmc_read(gpt["boot"][0] + 3)
+flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+if boot_hdr2[0:8] != b"ANDROID!":
+    flash_data(dev, boot_hdr1, gpt["boot"][0] + 2, 2 * 0x200)
+```
+
+Backups boot headers and injects microloader into the boot partition. If the second header isn't a valid Android boot image, restores the first header to blocks 2-3.
+
+### 12. Force Fastboot Mode
+
+```python
+force_fastboot(dev, gpt)
+```
+
+Configures the device to boot into fastboot mode on next reboot.
+
+### 13. Preloader Installation
+
+If device was in bootrom mode (not preloader):
+
+```python
+switch_boot0(dev)
+flash_binary(dev, "../bin/preloader.img", 0)
+```
+
+Installs the vulnerable preloader to boot0 partition at offset 0.
+
+### 14. Flush and Reboot
+
+```python
+time.sleep(5)  # Wait for data flush
+dev.reboot()
+```
+
+Waits 5 seconds for all writes to complete, then reboots the device into fastboot mode.
+
+## Expected Output
+
+```bash
+[INFO] Waiting for device
+[INFO] Found port = /dev/ttyACM0
+[INFO] Device found in bootrom mode
+[INFO] Loading payload...
+[INFO] Payload loaded successfully
+[INFO] Check device_type_id
+[INFO] Detected mantis (AKPGW064GI9HE)
+[INFO] Check GPT
+[INFO] gpt_parsed = {'lk': (6144, 1024), 'tee1': (7168, 1024), 'boot': (34816, 16384), ...}
+[INFO] Check boot0
+[INFO] Check rpmb
+[INFO] Downgrade rpmb
+[INFO] Recheck rpmb
+[INFO] rpmb downgrade ok
+[INFO] Flash tz
+[INFO] Flash lk
+[INFO] Flash lk-payload
+[INFO] Inject microloader
+[INFO] Force fastboot
+[INFO] Flash preloader
+[INFO] Reboot
+```
+
+## Error Handling
+
+<Warning>
+The script uses `set -e`, which means it will exit immediately if any command fails. All Python exceptions will cause the script to terminate.
+</Warning>
+
+**Common errors:**
+
+- **"Wrong device detected"**: Device is not mantis (AKPGW064GI9HE)
+- **"bad gpt"**: Missing required partitions in GPT
+- **"what's wrong with your BOOT0?"**: boot0 partition has unexpected data
+- **"downgrade failure, giving up"**: RPMB write verification failed
+
+## Prerequisites
+
+- Device must be in bootrom mode (achieved via hardware short) or preloader mode
+- ModemManager must be disabled/uninstalled on Linux
+- Python 3 with required dependencies (pyserial, pyusb)
+- All binary files must exist in `bin/` directory:
+  - `gpt-mantis.bin` (if using fixgpt)
+  - `tz.img`
+  - `lk.bin`
+  - `microloader.bin`
+  - `preloader.img`
+- `lk-payload/build/payload.bin` must be built
+
+## Related Scripts
+
+<CardGroup cols={2}>
+  <Card title="fastboot-step.sh" icon="forward" href="/api/fastboot-step">
+    Run after bootrom-step to flash TWRP recovery
+  </Card>
+  <Card title="boot-fastboot.sh" icon="bolt" href="/api/boot-scripts">
+    Boot device into fastboot mode
+  </Card>
+</CardGroup>
+
+## Technical Notes
+
+- The script operates directly on eMMC partitions via the bootrom exploit
+- RPMB zeroing is the key to bypassing Amazon's anti-rollback protection
+- The watchdog timer is periodically kicked to prevent device reset during long operations
+- All flash operations are performed in 512-byte (0x200) sectors
+- Data is padded to sector boundaries before writing

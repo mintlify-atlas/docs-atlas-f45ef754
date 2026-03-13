@@ -1,0 +1,306 @@
+---
+title: 'Stage 1 Payload'
+description: 'First-stage BROM payload for initial exploit and memory operations'
+icon: 'microchip'
+---
+
+## Overview
+
+The Stage 1 payload is the first code executed after the BootROM exploit. It runs in the BootROM context with limited functionality but provides essential capabilities for loading subsequent payloads and performing low-level memory operations.
+
+### Execution Context
+
+- **Load Address**: Injected via BROM exploit vulnerability
+- **Environment**: BootROM context (before eMMC initialization)
+- **Capabilities**: USB communication, memory access, basic UART output
+- **Limitations**: No eMMC access, minimal library functions
+
+## Command Protocol
+
+The Stage 1 payload implements a command-response protocol over USB. All commands follow this structure:
+
+1. Magic header: `0xf00dd00d` (32-bit)
+2. Command code: (32-bit)
+3. Command-specific parameters
+
+### Handshake Sequence
+
+```c
+// Stage 1 sends ready signal after initialization
+send_dword(0xA1A2A3A4);
+
+// Then enters command loop waiting for magic + command
+while (1) {
+    uint32_t magic = recv_dword();
+    if (magic != 0xf00dd00d) {
+        break; // Protocol error
+    }
+    uint32_t cmd = recv_dword();
+    // Process command...
+}
+```
+
+## Command Reference
+
+### 0x4000: Write Memory
+
+Writes arbitrary data to any memory address accessible in BROM context.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x4000
+Address: <target_address> (uint32_t)
+Size:    <byte_count> (uint32_t)
+Data:    <size bytes of payload data>
+```
+
+**Response**:
+- Success: `0xD0D0D0D0`
+- Failure: `0xF0F0F0F0`
+
+**Implementation** (stage1.c:35-48):
+```c
+case 0x4000: {
+    uint32_t address = recv_dword();
+    uint32_t size = recv_dword();
+    print("Write\n");
+    if(recv_data(address, size, 0) == 0) {
+        print("OK\n");
+        send_dword(0xD0D0D0D0);
+    } else {
+        send_dword(0xF0F0F0F0);
+        print("Read fail\n");
+    }
+    break;
+}
+```
+
+**Use Cases**:
+- Loading Stage 2 payload to memory
+- Patching BROM code or data structures
+- Setting up payload execution environment
+
+---
+
+### 0x4001: Jump to Address
+
+Transfers execution to an arbitrary address. Used to execute loaded payloads.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x4001
+Address: <jump_target> (uint32_t)
+```
+
+**No Response** (execution transfers immediately)
+
+**Implementation** (stage1.c:50-55):
+```c
+case 0x4001: {
+    void (*jump_address)(void) = (void*) recv_dword();
+    print("Jump\n");
+    jump_address();
+    break;
+}
+```
+
+**Use Cases**:
+- Jumping to Stage 2 payload after loading
+- Executing custom exploit code
+- Chain-loading additional payloads
+
+<Warning>
+After jump, Stage 1 payload no longer has control. Ensure target code is correctly loaded and entry point is valid.
+</Warning>
+
+---
+
+### 0x3000: Reboot Device
+
+Performs a hardware reset by writing to the watchdog timer registers.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x3000
+```
+
+**No Response** (device resets immediately)
+
+**Implementation** (stage1.c:57-66):
+```c
+case 0x3000: {
+    print("Reboot\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;      // Unlock watchdog
+    reg[0/4] = 0x22000014;  // Configure reset
+    reg[0x14/4] = 0x1209;   // Trigger reset
+    
+    while (1) {
+        // Wait for reset
+    }
+}
+```
+
+**Hardware Details**:
+- **Register Base**: `0x10007000` (MTK Watchdog Timer)
+- **Magic Values**: `0x1971` (unlock), `0x22000014` (mode), `0x1209` (trigger)
+
+---
+
+### 0x3001: Kick Watchdog
+
+Resets the watchdog timer to prevent automatic reboot. Useful for operations that take extended time.
+
+**Protocol**:
+```
+Magic:   0xf00dd00d
+Command: 0x3001
+```
+
+**No Response**
+
+**Implementation** (stage1.c:68-72):
+```c
+case 0x3001: {
+    print("Kick watchdog\n");
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;  // Unlock and reset watchdog
+    break;
+}
+```
+
+**Use Cases**:
+- Long-running operations (large memory writes)
+- Preventing timeout during payload loading
+- Interactive debugging sessions
+
+## UART Output
+
+Stage 1 provides basic debug output via UART for development and troubleshooting.
+
+**Implementation** (stage1.c:4-12):
+```c
+int print(char* s){
+    char c = s[0];
+    int i = 0;
+    while(c){
+        _putchar(c);
+        c = s[++i];
+    }
+    return i;
+}
+```
+
+**Boot Messages**:
+```
+Entered 1ST stage payload
+Copyright xyz, k4y0z 2019
+Send USB response
+Entering command loop
+```
+
+<Note>
+UART output appears on the device's debug serial port. Requires hardware debug cable for monitoring.
+</Note>
+
+## Memory Layout
+
+Stage 1 operates in BROM's memory space with these constraints:
+
+| Region | Address Range | Purpose |
+|--------|---------------|----------|
+| BROM | 0x00000000-0x00020000 | ROM code (read-only) |
+| SRAM | 0x00100000-0x00120000 | BROM working memory |
+| Payload | Variable | Stage 1 payload code |
+
+<Warning>
+Avoid writing to BROM code region or critical SRAM structures. This can brick the device.
+</Warning>
+
+## Error Handling
+
+### Protocol Errors
+
+If an invalid magic is received, Stage 1 exits the command loop:
+
+```c
+if (magic != 0xf00dd00d) {
+    print("Protocol error\n");
+    break;
+}
+```
+
+### Invalid Commands
+
+```c
+default:
+    print("Invalid command\n");
+    break;
+```
+
+## Usage Example
+
+Typical Stage 1 usage flow:
+
+```python
+import struct
+
+def send_command(magic, cmd):
+    """Send command header"""
+    device.write(struct.pack('<II', magic, cmd))
+
+def stage1_write(address, data):
+    """Write data to memory via Stage 1"""
+    send_command(0xf00dd00d, 0x4000)
+    device.write(struct.pack('<II', address, len(data)))
+    device.write(data)
+    response = struct.unpack('<I', device.read(4))[0]
+    return response == 0xD0D0D0D0
+
+def stage1_jump(address):
+    """Jump to loaded payload"""
+    send_command(0xf00dd00d, 0x4001)
+    device.write(struct.pack('<I', address))
+
+# Wait for Stage 1 ready signal
+ready = struct.unpack('<I', device.read(4))[0]
+assert ready == 0xA1A2A3A4
+
+# Load Stage 2 payload
+with open('stage2.bin', 'rb') as f:
+    stage2 = f.read()
+    
+stage1_write(0x00110000, stage2)  # Load to SRAM
+stage1_jump(0x00110000)            # Execute Stage 2
+```
+
+## Limitations
+
+- **No eMMC Access**: Cannot read/write storage (use Stage 2 for this)
+- **Limited Memory**: SRAM size restricts payload sizes
+- **No MMC Functions**: eMMC controller not initialized in BROM
+- **Basic I/O**: Only USB and UART available
+
+## Transition to Stage 2
+
+Stage 1's primary purpose is loading and executing Stage 2:
+
+1. Exploit triggers, Stage 1 loads
+2. Host receives ready signal (`0xA1A2A3A4`)
+3. Host sends Stage 2 binary via `0x4000` (Write)
+4. Host jumps to Stage 2 via `0x4001` (Jump)
+5. Stage 2 initializes eMMC and provides full functionality
+
+See [Stage 2 Payload](/api/stage2-payload) for eMMC operations.
+
+## Source Reference
+
+Full implementation: `brom-payload/stage1.c`
+
+**Key Files**:
+- `stage1.c` - Main payload logic
+- `brom_common.h` - BROM function declarations
+- `common.h` - USB communication functions

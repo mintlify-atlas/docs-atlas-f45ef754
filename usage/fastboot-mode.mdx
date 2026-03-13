@@ -1,0 +1,588 @@
+---
+title: "Fastboot Mode"
+description: "Using fastboot mode for device management and recovery operations"
+---
+
+# Fastboot Mode
+
+Fastboot is a protocol for communicating with bootloaders over USB. After successfully exploiting your device with Kamakiri, you can use fastboot mode to flash images, unlock the bootloader, and perform various device management tasks.
+
+<Info>
+  **Automatic Boot**: The Kamakiri exploit automatically configures the device to boot into fastboot mode after exploitation. You can also manually trigger fastboot mode using the boot scripts.
+</Info>
+
+## Entering Fastboot Mode
+
+### Automatic Entry
+
+After running the bootrom exploit, the device automatically boots into fastboot:
+
+```bash
+./bootrom-step.sh
+```
+
+The exploit writes a magic string to the MISC partition:
+
+```python
+def force_fastboot(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:16] = "FASTBOOT_PLEASE\x00".encode("utf-8")
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+```
+
+This flag persists until explicitly cleared, causing the device to boot into fastboot mode on every reboot.
+
+### Manual Entry
+
+To manually force fastboot mode:
+
+```bash
+./boot-fastboot.sh
+```
+
+**Script contents**:
+```bash
+#!/bin/bash
+set -e
+cd modules
+python3 handshake2.py FACTFACT
+cd ..
+```
+
+This sends the `FACTFACT` command to the preloader:
+
+```python
+def handshake2(dev, cmd='FACTFACT'):
+    # look for start byte
+    c = 0
+    while c != b'Y':
+        c = dev.read()
+    log("Preloader ready, sending " + cmd)
+    command = str.encode(cmd)
+    dev.write(command)
+    dev.flushInput()
+```
+
+The preloader interprets `FACTFACT` as a command to boot into fastboot mode.
+
+<Note>
+  **Preloader Mode Required**: `boot-fastboot.sh` only works when the device is in preloader mode. If you're in bootrom mode, use the full exploit instead.
+</Note>
+
+## Verifying Fastboot Connection
+
+Check if the device is detected:
+
+```bash
+fastboot devices
+```
+
+Expected output:
+```
+0123456789ABCDEF        fastboot
+```
+
+If the device is not detected:
+
+<Steps>
+  <Step title="Check USB Connection">
+    Ensure the USB cable is properly connected and supports data transfer (not charge-only).
+  </Step>
+
+  <Step title="Try with Sudo">
+    On some Linux systems, you need root permissions:
+    ```bash
+    sudo fastboot devices
+    ```
+  </Step>
+
+  <Step title="Install udev Rules">
+    Create `/etc/udev/rules.d/51-android.rules`:
+    ```bash
+    # MediaTek devices
+    SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666", GROUP="plugdev"
+    # Amazon devices
+    SUBSYSTEM=="usb", ATTR{idVendor}=="1949", MODE="0666", GROUP="plugdev"
+    ```
+
+    Reload udev rules:
+    ```bash
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    ```
+  </Step>
+
+  <Step title="Check Device Status">
+    Verify the bootloader status:
+    ```bash
+    fastboot getvar all
+    ```
+  </Step>
+</Steps>
+
+## Fastboot Commands
+
+### Basic Device Information
+
+<Tabs>
+  <Tab title="Get All Variables">
+    ```bash
+    fastboot getvar all
+    ```
+
+    Example output:
+    ```
+    (bootloader) version: 0.5
+    (bootloader) version-bootloader: 1.0.0
+    (bootloader) version-baseband: N/A
+    (bootloader) product: mantis
+    (bootloader) kernel: lk
+    (bootloader) secure: no
+    (bootloader) unlocked: yes
+    (bootloader) partition-size:boot: 0x1000000
+    (bootloader) partition-type:boot: raw
+    (bootloader) partition-size:recovery: 0x1000000
+    (bootloader) partition-type:recovery: raw
+    (bootloader) partition-size:system: 0x40000000
+    (bootloader) partition-type:system: ext4
+    ```
+  </Tab>
+
+  <Tab title="Get Specific Variable">
+    ```bash
+    fastboot getvar unlocked
+    ```
+
+    Output:
+    ```
+    unlocked: yes
+    ```
+
+    Common variables:
+    - `unlocked`: Bootloader lock state
+    - `product`: Device codename
+    - `secure`: Secure boot status
+    - `serialno`: Device serial number
+    - `version-bootloader`: Bootloader version
+  </Tab>
+
+  <Tab title="List Partitions">
+    ```bash
+    fastboot getvar partition-size:boot
+    fastboot getvar partition-size:recovery
+    fastboot getvar partition-size:system
+    ```
+
+    Shows partition sizes in hexadecimal.
+  </Tab>
+</Tabs>
+
+### Flashing Partitions
+
+<Warning>
+  **Backup First**: Always backup partitions before flashing. Incorrect flashing can brick your device.
+</Warning>
+
+<Tabs>
+  <Tab title="Flash Recovery">
+    ```bash
+    fastboot flash recovery twrp.img
+    ```
+
+    This is the primary operation after bootrom exploitation:
+
+    ```bash
+    ./fastboot-step.sh
+    ```
+
+    **Script contents**:
+    ```bash
+    #!/bin/bash
+    set -e
+    fastboot flash recovery bin/twrp.img
+    fastboot oem reboot-recovery
+    
+    echo ""
+    echo "Your device will now reboot into TWRP."
+    echo ""
+    ```
+
+    Expected output:
+    ```
+    Sending 'recovery' (16384 KB)                      OKAY [  0.523s]
+    Writing 'recovery'                                 OKAY [  0.234s]
+    Finished. Total time: 0.812s
+    ```
+  </Tab>
+
+  <Tab title="Flash Boot Image">
+    ```bash
+    fastboot flash boot boot.img
+    ```
+
+    Flash a custom kernel or boot image.
+
+    <Note>
+      The boot partition is where the microloader is installed during exploitation. Flashing a new boot image will remove the microloader but preserve the unlocked bootloader.
+    </Note>
+  </Tab>
+
+  <Tab title="Flash System">
+    ```bash
+    fastboot flash system system.img
+    ```
+
+    Flash a complete system image. This can take several minutes.
+
+    <Warning>
+      Large partitions may timeout. Use `fastboot -w` option to erase userdata if needed.
+    </Warning>
+  </Tab>
+
+  <Tab title="Flash Multiple Partitions">
+    ```bash
+    fastboot flash boot boot.img
+    fastboot flash system system.img
+    fastboot flash vendor vendor.img
+    fastboot flash userdata userdata.img
+    ```
+
+    Flash multiple partitions sequentially.
+  </Tab>
+</Tabs>
+
+### Erasing Partitions
+
+<CodeGroup>
+  ```bash Erase Single Partition
+  fastboot erase cache
+  fastboot erase userdata
+  ```
+
+  ```bash Factory Reset
+  fastboot -w
+  ```
+
+  ```bash Erase Boot
+  fastboot erase boot
+  ```
+</CodeGroup>
+
+<Warning>
+  - `fastboot -w` erases userdata and cache (factory reset)
+  - Erasing boot or recovery can make the device unbootable
+  - Erasing system will remove the OS
+</Warning>
+
+### Booting Images
+
+Boot an image without flashing:
+
+```bash
+fastboot boot recovery.img
+```
+
+This loads the image into RAM and boots it temporarily. Useful for:
+- Testing recovery images before flashing
+- Running diagnostic tools
+- Temporary root access
+
+<Info>
+  **Temporary Only**: The image is not written to storage and will not persist after reboot.
+</Info>
+
+### Rebooting
+
+<Tabs>
+  <Tab title="Normal Reboot">
+    ```bash
+    fastboot reboot
+    ```
+
+    Reboots into normal system mode.
+  </Tab>
+
+  <Tab title="Reboot to Recovery">
+    ```bash
+    fastboot reboot-recovery
+    ```
+
+    Or using OEM command:
+    ```bash
+    fastboot oem reboot-recovery
+    ```
+
+    Reboots directly into recovery mode.
+  </Tab>
+
+  <Tab title="Reboot to Bootloader">
+    ```bash
+    fastboot reboot-bootloader
+    ```
+
+    Reboots back into fastboot mode.
+  </Tab>
+
+  <Tab title="Continue Boot">
+    ```bash
+    fastboot continue
+    ```
+
+    Exits fastboot and continues normal boot process.
+  </Tab>
+</Tabs>
+
+## OEM Commands
+
+MediaTek bootloaders support OEM-specific commands:
+
+<AccordionGroup>
+  <Accordion title="reboot-recovery" icon="rotate">
+    ```bash
+    fastboot oem reboot-recovery
+    ```
+
+    Reboots into recovery mode. Used by `fastboot-step.sh` after flashing TWRP:
+
+    ```bash
+    fastboot flash recovery bin/twrp.img
+    fastboot oem reboot-recovery
+    ```
+  </Accordion>
+
+  <Accordion title="Device Info" icon="info">
+    ```bash
+    fastboot oem device-info
+    ```
+
+    Shows bootloader lock status and other device information.
+
+    Example output:
+    ```
+    (bootloader) Device tampered: true
+    (bootloader) Device unlocked: true
+    (bootloader) Device critical unlocked: true
+    (bootloader) Charger screen enabled: false
+    OKAY [  0.012s]
+    ```
+  </Accordion>
+
+  <Accordion title="Lock/Unlock" icon="lock">
+    <Warning>
+      **Not Recommended**: Do not lock the bootloader after using Kamakiri. Locking can brick the device.
+    </Warning>
+
+    ```bash
+    # Unlock (should already be unlocked)
+    fastboot oem unlock
+    
+    # Lock (DANGEROUS - DO NOT USE)
+    fastboot oem lock
+    ```
+
+    The Kamakiri exploit bypasses the unlock process, so these commands may not work as expected.
+  </Accordion>
+</AccordionGroup>
+
+## Persistent Fastboot
+
+The MISC partition flag makes fastboot mode persistent:
+
+```python
+# Force fastboot on every boot
+block[0:16] = "FASTBOOT_PLEASE\x00".encode("utf-8")
+```
+
+To clear this flag and boot normally, you need to clear the MISC partition:
+
+```python
+def clear_flags(dev, gpt):
+    switch_user(dev)
+    block = list(dev.emmc_read(gpt["MISC"][0]))
+    block[0:32] = b"\x00" * 32
+    dev.emmc_write(gpt["MISC"][0], bytes(block))
+```
+
+<Note>
+  Kamakiri doesn't include a built-in script to clear the fastboot flag. You'll need to either:
+  1. Boot into recovery and flash a ROM
+  2. Manually clear the MISC partition using the Python API
+  3. Flash a stock ROM via fastboot
+</Note>
+
+## Advanced Fastboot Operations
+
+### Backing Up Partitions
+
+Fastboot doesn't directly support reading partitions. To backup:
+
+<Steps>
+  <Step title="Boot into TWRP">
+    ```bash
+    fastboot reboot-recovery
+    ```
+  </Step>
+
+  <Step title="Use ADB to Backup">
+    ```bash
+    adb pull /dev/block/platform/*/by-name/boot boot_backup.img
+    adb pull /dev/block/platform/*/by-name/system system_backup.img
+    ```
+  </Step>
+</Steps>
+
+Alternatively, use the direct eMMC access from the bootrom exploit to backup partitions before making changes.
+
+### Flashing Sparse Images
+
+Large system images are often in sparse format:
+
+```bash
+fastboot flash system system.img
+```
+
+Fastboot automatically detects and handles sparse images. If you encounter issues:
+
+```bash
+# Convert sparse to raw
+simg2img system.img system_raw.img
+
+# Flash raw image
+fastboot flash system system_raw.img
+```
+
+### Scripted Flashing
+
+Create a flash script for multiple partitions:
+
+```bash flash-all.sh
+#!/bin/bash
+set -e
+
+echo "Flashing custom ROM..."
+
+fastboot flash boot boot.img
+fastboot flash system system.img
+fastboot flash vendor vendor.img
+fastboot flash recovery recovery.img
+
+echo "Erasing userdata..."
+fastboot erase userdata
+fastboot erase cache
+
+echo "Rebooting..."
+fastboot reboot
+
+echo "Done!"
+```
+
+Usage:
+```bash
+chmod +x flash-all.sh
+./flash-all.sh
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Device not detected" icon="usb">
+    **Problem**: `fastboot devices` shows nothing.
+
+    **Solutions**:
+    1. Try with sudo:
+       ```bash
+       sudo fastboot devices
+       ```
+
+    2. Check USB cable (must support data transfer)
+
+    3. Install udev rules (see "Verifying Fastboot Connection" above)
+
+    4. Try different USB port (preferably USB 2.0)
+
+    5. Verify device is actually in fastboot mode (check serial output)
+  </Accordion>
+
+  <Accordion title="FAILED (remote: partition table doesn't exist)" icon="table">
+    **Problem**: Partition doesn't exist or GPT is corrupted.
+
+    **Solution**:
+    ```bash
+    ./gpt-fix.sh
+    ```
+
+    This restores the stock GPT for Mantis devices.
+  </Accordion>
+
+  <Accordion title="FAILED (remote: download error)" icon="download">
+    **Problem**: USB transfer error during image download.
+
+    **Solutions**:
+    1. Check USB cable quality
+    2. Try different USB port
+    3. Reduce USB transfer size (if possible)
+    4. Check available power to device
+  </Accordion>
+
+  <Accordion title="Device stuck in fastboot" icon="spinner">
+    **Problem**: Device won't exit fastboot mode.
+
+    **Cause**: MISC partition has persistent fastboot flag.
+
+    **Solutions**:
+    1. Flash recovery and reboot:
+       ```bash
+       fastboot flash recovery twrp.img
+       fastboot oem reboot-recovery
+       ```
+
+    2. Flash a complete ROM that clears MISC
+
+    3. Use bootrom exploit to manually clear MISC partition
+  </Accordion>
+
+  <Accordion title="FAILED (remote: not allowed in locked state)" icon="lock">
+    **Problem**: Bootloader is somehow locked.
+
+    **Solution**: Re-run the bootrom exploit:
+    ```bash
+    ./bootrom-step.sh
+    ```
+
+    This should not happen after a successful Kamakiri exploit.
+  </Accordion>
+</AccordionGroup>
+
+## Comparison with Normal Android Fastboot
+
+<Note>
+  The MediaTek bootloader has some differences from Qualcomm fastboot:
+</Note>
+
+| Feature | Qualcomm | MediaTek (Kamakiri) |
+|---------|----------|---------------------|
+| Unlock command | `fastboot oem unlock` | Exploited (bypass) |
+| Partition read | Not supported | Not supported |
+| Sparse images | Supported | Supported |
+| Boot temporary | `fastboot boot` | `fastboot boot` |
+| Flash partitions | Standard | Standard |
+| OEM commands | Varies | `reboot-recovery` |
+| Lock state | Stored in TZ | Bypassed via RPMB |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Recovery Mode" icon="screwdriver-wrench" href="/usage/recovery-mode">
+    Use TWRP recovery for system modifications
+  </Card>
+  <Card title="Boot Scripts" icon="terminal" href="/api/boot-scripts">
+    API reference for boot control scripts
+  </Card>
+  <Card title="eMMC Operations" icon="database" href="/advanced/emmc-operations">
+    Direct storage access and manipulation
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/advanced/troubleshooting">
+    Advanced troubleshooting guide
+  </Card>
+</CardGroup>

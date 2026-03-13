@@ -1,0 +1,242 @@
+---
+title: 'Prerequisites'
+description: 'Hardware and software requirements for running Kamakiri'
+---
+
+Before you begin using Kamakiri, ensure you have the necessary hardware, software, and system configurations in place.
+
+## Hardware Requirements
+
+<CardGroup cols={2}>
+  <Card title="Compatible Device" icon="mobile">
+    Kamakiri is designed for MediaTek MT8163 (Karnak) based devices, specifically targeting Amazon Fire tablets with device type ID `AKPGW064GI9HE` (Mantis).
+  </Card>
+  <Card title="USB Cable" icon="cable-car">
+    A reliable USB data cable capable of both power delivery and data transmission. Quality matters for stable serial communication.
+  </Card>
+</CardGroup>
+
+<Note>
+  The exploit specifically checks for the device type ID `AKPGW064GI9HE` (Mantis). Other device models are not supported and will cause the exploit to exit with an error.
+</Note>
+
+## Software Requirements
+
+### Python Environment
+
+Kamakiri requires Python 3 with the following dependencies:
+
+<CodeGroup>
+```txt requirements.txt
+future==0.17.1
+iso8601==0.1.12
+pyserial==3.4
+pyusb==1.0.2
+PyYAML==5.1.2
+```
+</CodeGroup>
+
+<Steps>
+  <Step title="Install Python 3">
+    Ensure Python 3.6 or higher is installed on your system:
+    
+    ```bash
+    python3 --version
+    ```
+  </Step>
+  
+  <Step title="Install pip">
+    Verify that pip is available for installing Python packages:
+    
+    ```bash
+    pip3 --version
+    ```
+  </Step>
+</Steps>
+
+### Build Toolchain
+
+The exploit requires ARM cross-compilation tools to build payload binaries:
+
+<Tabs>
+  <Tab title="Ubuntu/Debian">
+    ```bash
+    sudo apt-get update
+    sudo apt-get install gcc-arm-none-eabi binutils-arm-none-eabi
+    ```
+  </Tab>
+  
+  <Tab title="Fedora/RHEL">
+    ```bash
+    sudo dnf install arm-none-eabi-gcc-cs arm-none-eabi-binutils
+    ```
+  </Tab>
+  
+  <Tab title="Arch Linux">
+    ```bash
+    sudo pacman -S arm-none-eabi-gcc arm-none-eabi-binutils
+    ```
+  </Tab>
+  
+  <Tab title="macOS">
+    ```bash
+    brew install arm-none-eabi-gcc
+    ```
+  </Tab>
+</Tabs>
+
+Verify the toolchain installation:
+
+```bash
+arm-none-eabi-gcc --version
+arm-none-eabi-as --version
+arm-none-eabi-objcopy --version
+```
+
+### Fastboot Tools
+
+For flashing TWRP and managing the device after exploit:
+
+<Tabs>
+  <Tab title="Ubuntu/Debian">
+    ```bash
+    sudo apt-get install android-tools-fastboot
+    ```
+  </Tab>
+  
+  <Tab title="Fedora/RHEL">
+    ```bash
+    sudo dnf install android-tools
+    ```
+  </Tab>
+  
+  <Tab title="Arch Linux">
+    ```bash
+    sudo pacman -S android-tools
+    ```
+  </Tab>
+  
+  <Tab title="macOS">
+    ```bash
+    brew install android-platform-tools
+    ```
+  </Tab>
+</Tabs>
+
+## System Preparation
+
+### Linux: Disable ModemManager
+
+<Warning>
+  **Critical**: ModemManager will interfere with the serial communication required for the bootrom exploit. You must disable or remove it before proceeding.
+</Warning>
+
+Kamakiri automatically checks for ModemManager at startup (`modules/common.py:24-34`):
+
+```python
+def check_modemmanager():
+    pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+    for pid in pids:
+        try:
+            args = open(os.path.join('/proc', pid, 'cmdline'), 'rb').read().decode("utf-8").split('\0')
+            if len(args) > 0 and "modemmanager" in args[0].lower():
+                print("You need to temporarily disable/uninstall ModemManager before this script can proceed")
+                sys.exit(1)
+        except IOError:
+            continue
+```
+
+To disable ModemManager:
+
+<Tabs>
+  <Tab title="Temporary (systemd)">
+    ```bash
+    sudo systemctl stop ModemManager
+    sudo systemctl disable ModemManager
+    ```
+  </Tab>
+  
+  <Tab title="Permanent Removal">
+    ```bash
+    # Ubuntu/Debian
+    sudo apt-get remove modemmanager
+    
+    # Fedora/RHEL
+    sudo dnf remove ModemManager
+    
+    # Arch Linux
+    sudo pacman -R modemmanager
+    ```
+  </Tab>
+</Tabs>
+
+Verify ModemManager is not running:
+
+```bash
+ps aux | grep -i modemmanager
+```
+
+### USB Permissions (Linux)
+
+Add udev rules to allow non-root access to MediaTek devices:
+
+```bash udev-rule.sh
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0666", GROUP="plugdev"' | sudo tee /etc/udev/rules.d/51-mediatek.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Add your user to the `plugdev` group:
+
+```bash
+sudo usermod -a -G plugdev $USER
+```
+
+<Note>
+  You may need to log out and back in for group changes to take effect.
+</Note>
+
+### Serial Port Access
+
+The exploit communicates over serial with these parameters:
+
+- **Baud Rate**: 115200
+- **Timeout**: 5 seconds
+- **Vendor ID**: 0x0E8D (MediaTek)
+- **Product ID**: 0x0003 (BootROM mode)
+
+On Linux, verify you have access to serial ports:
+
+```bash
+sudo usermod -a -G dialout $USER
+```
+
+## Verification Checklist
+
+Before proceeding to installation, verify:
+
+<AccordionGroup>
+  <Accordion title="Hardware" icon="check">
+    - [ ] Compatible MediaTek device (Mantis)
+    - [ ] Quality USB data cable
+    - [ ] Device can boot normally
+  </Accordion>
+  
+  <Accordion title="Software" icon="check">
+    - [ ] Python 3.6+ installed
+    - [ ] ARM cross-compiler toolchain installed
+    - [ ] Fastboot tools installed
+    - [ ] All required Python packages can be installed
+  </Accordion>
+  
+  <Accordion title="System Configuration" icon="check">
+    - [ ] ModemManager disabled/removed (Linux)
+    - [ ] USB permissions configured (Linux)
+    - [ ] User added to dialout/plugdev groups (Linux)
+    - [ ] Serial devices accessible without root
+  </Accordion>
+</AccordionGroup>
+
+<Check>
+  Once all prerequisites are met, you're ready to proceed with [Installation](/installation).
+</Check>

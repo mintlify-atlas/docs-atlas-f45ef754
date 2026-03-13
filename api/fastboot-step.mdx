@@ -1,0 +1,231 @@
+---
+title: 'fastboot-step.sh'
+description: 'Flash TWRP recovery and reboot into recovery mode via fastboot'
+---
+
+## Overview
+
+`fastboot-step.sh` is the second-stage script that installs TWRP (Team Win Recovery Project) custom recovery and boots the device into recovery mode. This script must be run after `bootrom-step.sh` has successfully completed and the device has booted into fastboot mode.
+
+## Usage
+
+```bash
+./fastboot-step.sh
+```
+
+## Arguments
+
+This script takes no arguments.
+
+## What It Does
+
+The script performs two simple but critical fastboot operations:
+
+### 1. Flash TWRP Recovery Image
+
+```bash
+fastboot flash recovery bin/twrp.img
+```
+
+Flashes the TWRP recovery image to the `recovery` partition of the device.
+
+**Expected output:**
+```
+Sending 'recovery' (XXXXX KB)                      OKAY [  X.XXXs]
+Writing 'recovery'                                 OKAY [  X.XXXs]
+Finished. Total time: X.XXXs
+```
+
+### 2. Reboot into Recovery Mode
+
+```bash
+fastboot oem reboot-recovery
+```
+
+Issues an OEM-specific fastboot command to reboot directly into the newly flashed TWRP recovery.
+
+**Expected output:**
+```
+                                                   OKAY [  0.001s]
+Finished. Total time: 0.001s
+```
+
+### 3. User Notification
+
+```bash
+echo ""
+echo "Your device will now reboot into TWRP."
+echo ""
+```
+
+Displays a confirmation message to the user that the device is rebooting into TWRP recovery.
+
+## Complete Terminal Session
+
+Here's what a successful run looks like:
+
+```bash
+$ ./fastboot-step.sh
+Sending 'recovery' (24576 KB)                      OKAY [  0.823s]
+Writing 'recovery'                                 OKAY [  0.491s]
+Finished. Total time: 1.338s
+                                                   OKAY [  0.001s]
+Finished. Total time: 0.001s
+
+Your device will now reboot into TWRP.
+
+```
+
+## Prerequisites
+
+<Warning>
+This script must be run in sequence after `bootrom-step.sh`. Do not skip the first step.
+</Warning>
+
+**Requirements:**
+
+1. **Device in fastboot mode**: After running `bootrom-step.sh`, your device should automatically reboot into fastboot mode
+2. **Fastboot tools installed**: The `fastboot` command must be available in your PATH
+3. **TWRP image present**: `bin/twrp.img` must exist in the project directory
+4. **USB connection**: Device must be connected via USB cable
+5. **Proper USB drivers**: Linux/macOS should work automatically; Windows requires Android USB drivers
+
+## Verification
+
+To verify the device is in fastboot mode before running this script:
+
+```bash
+fastboot devices
+```
+
+Expected output:
+```
+0123456789ABCDEF    fastboot
+```
+
+If no devices are listed, the device is not in fastboot mode or drivers are not properly installed.
+
+## Error Handling
+
+<Info>
+The script uses `set -e`, which means it will exit immediately if any command fails.
+</Info>
+
+**Common errors:**
+
+### "Waiting for device"
+
+```
+< waiting for any device >
+```
+
+**Cause**: Device not detected in fastboot mode
+
+**Solutions**:
+- Verify device is in fastboot mode with `fastboot devices`
+- Check USB cable connection
+- Try a different USB port
+- On Linux, verify udev rules are configured for fastboot
+- On Windows, install Android USB drivers
+
+### "FAILED (remote: flash write failure)"
+
+```
+Writing 'recovery'                                 FAILED (remote: flash write failure)
+```
+
+**Cause**: Unable to write to recovery partition
+
+**Solutions**:
+- Ensure `bootrom-step.sh` completed successfully
+- Verify the recovery partition exists and is unlocked
+- Check that `bin/twrp.img` is not corrupted
+
+### "FAILED (remote: unknown command)"
+
+```
+FAILED (remote: unknown command)
+```
+
+**Cause**: The `oem reboot-recovery` command is not supported
+
+**Solutions**:
+- This may indicate the wrong bootloader is installed
+- Verify `bootrom-step.sh` completed successfully
+- Manually reboot by holding Power + Volume Up buttons
+
+## TWRP Recovery
+
+Once the device reboots into TWRP, you will see:
+
+- TWRP splash screen with logo
+- Touch-based recovery interface
+- Options to Install, Wipe, Backup, Restore, Mount, and Settings
+- ADB sideload capability for installing custom ROMs
+
+### TWRP Features
+
+<CardGroup cols={2}>
+  <Card title="Install" icon="download">
+    Flash custom ROMs, kernels, mods, and GApps packages
+  </Card>
+  <Card title="Wipe" icon="eraser">
+    Factory reset, wipe cache, dalvik, or specific partitions
+  </Card>
+  <Card title="Backup" icon="floppy-disk">
+    Create complete Nandroid backups of your system
+  </Card>
+  <Card title="ADB Shell" icon="terminal">
+    Full root shell access via `adb shell` from your computer
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+After successfully booting into TWRP:
+
+1. **Create a backup**: Always create a complete Nandroid backup before making system modifications
+2. **Install custom ROM**: Use TWRP's Install feature to flash LineageOS or other custom firmware
+3. **Install root**: Flash Magisk or SuperSU for root access
+4. **Install GApps**: Flash Google Apps package if your ROM doesn't include them
+
+## Troubleshooting Boot Loops
+
+If the device boot loops instead of entering TWRP:
+
+1. Hold **Power + Volume Up** during boot to manually enter recovery
+2. If that fails, re-run `boot-recovery.sh` to force boot into TWRP
+3. As a last resort, re-run the entire exploit starting from `bootrom-step.sh`
+
+## Technical Notes
+
+- TWRP is flashed to the `recovery` partition, not `boot`
+- The `oem reboot-recovery` command is MediaTek-specific
+- TWRP provides a complete Linux environment with root access
+- The recovery partition is typically 16-32 MB in size
+- TWRP images are boot image format (ANDROID! header)
+
+## Related Scripts
+
+<CardGroup cols={2}>
+  <Card title="bootrom-step.sh" icon="backward" href="/api/bootrom-step">
+    Previous step - run this first to perform the exploit
+  </Card>
+  <Card title="boot-recovery.sh" icon="rotate" href="/api/boot-scripts">
+    Force boot into recovery mode if needed
+  </Card>
+</CardGroup>
+
+## File Requirements
+
+### bin/twrp.img
+
+The TWRP recovery image must be:
+- **Device-specific**: Built for Amazon Fire HD 8 (mantis)
+- **ARM architecture**: Compatible with MediaTek MT8163
+- **File size**: Typically 20-30 MB
+- **Format**: Android boot image with TWRP ramdisk
+
+<Tip>
+The TWRP image included with Kamakiri is pre-configured for the Fire HD 8 and includes necessary drivers and touch support.
+</Tip>

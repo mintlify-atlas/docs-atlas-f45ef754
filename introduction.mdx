@@ -1,0 +1,128 @@
+---
+title: Introduction
+description: A bootrom exploit tool for MediaTek devices enabling bootloader unlock and custom recovery installation
+---
+
+# Welcome to Kamakiri
+
+Kamakiri is a powerful bootrom exploit tool designed for MediaTek devices, specifically targeting the Amazon Fire TV Stick 4K (Mantis). This tool enables bootloader unlock and custom recovery installation through low-level hardware exploitation.
+
+<Warning>
+  **Security Research Tool**: Kamakiri is designed for security research and device modification. Using this tool will void your warranty and may brick your device if used incorrectly. Proceed at your own risk.
+</Warning>
+
+## What is Kamakiri?
+
+Kamakiri exploits a vulnerability in the MediaTek bootrom to gain low-level access to devices. Once access is obtained, the tool can:
+
+- Bypass bootloader security checks
+- Install custom recovery (TWRP)
+- Unlock the bootloader without manufacturer authorization
+- Enable fastboot mode without physical button combinations
+- Modify partition tables and system partitions
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Bootrom Exploitation" icon="microchip">
+    Direct exploitation of MediaTek bootrom vulnerabilities for maximum device access
+  </Card>
+  <Card title="Multi-Stage Payloads" icon="layer-group">
+    Sophisticated payload architecture with stage1, stage2, and preloader payloads
+  </Card>
+  <Card title="eMMC Operations" icon="database">
+    Direct read/write access to eMMC storage via serial protocol
+  </Card>
+  <Card title="RPMB Downgrade" icon="shield-halved">
+    Downgrade RPMB (Replay Protected Memory Block) for bootloader unlock
+  </Card>
+  <Card title="Custom Recovery" icon="screwdriver-wrench">
+    Install TWRP recovery for advanced device modification
+  </Card>
+  <Card title="Fastboot Access" icon="bolt">
+    Enable fastboot mode without hardware buttons for easier device management
+  </Card>
+</CardGroup>
+
+## How It Works
+
+Kamakiri works by exploiting the MediaTek bootrom's USB protocol handler. The exploit follows this sequence:
+
+<Steps>
+  <Step title="USB Connection">
+    Connect to the device via USB serial interface while it's in bootrom mode
+  </Step>
+  <Step title="Bootrom Handshake">
+    Perform the bootrom handshake protocol to establish communication
+  </Step>
+  <Step title="Payload Injection">
+    Inject stage1 payload into bootrom memory using a buffer overflow vulnerability
+  </Step>
+  <Step title="Memory Access">
+    Gain arbitrary memory read/write access through the stage1 payload
+  </Step>
+  <Step title="Stage2 Execution">
+    Load and execute stage2 payload with full eMMC access capabilities
+  </Step>
+  <Step title="System Modification">
+    Modify bootloader, recovery, and system partitions as needed
+  </Step>
+</Steps>
+
+## Supported Devices
+
+Currently, Kamakiri supports:
+
+- **Amazon Fire TV Stick 4K (Mantis)** - Device type ID: `AKPGW064GI9HE`
+
+The exploit targets MediaTek SoCs with specific bootrom vulnerabilities. Support for additional devices may be added in the future.
+
+## Architecture Overview
+
+Kamakiri consists of several components working together:
+
+- **Python Modules**: High-level orchestration and USB communication (`modules/`)
+- **Shell Scripts**: User-facing commands for common operations (`bootrom-step.sh`, etc.)
+- **C Payloads**: Low-level code executed on the device (`brom-payload/`, `lk-payload/`, `microloader/`)
+- **Binary Assets**: Precompiled bootloader and recovery images (`bin/`)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Prerequisites" icon="list-check" href="/prerequisites">
+    Check system requirements and prepare your device
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Kamakiri and its dependencies
+  </Card>
+  <Card title="Quickstart Guide" icon="rocket" href="/usage/quickstart">
+    Run your first bootrom exploit
+  </Card>
+  <Card title="Architecture Deep Dive" icon="sitemap" href="/advanced/architecture">
+    Learn how Kamakiri works under the hood
+  </Card>
+</CardGroup>
+
+## Safety & Legal Considerations
+
+<Note>
+  **Educational Purpose**: This tool is provided for educational and security research purposes. Always ensure you have proper authorization before modifying any device.
+</Note>
+
+Key considerations:
+
+- **Warranty Void**: Using Kamakiri will void your device warranty
+- **Brick Risk**: Incorrect usage can permanently damage your device
+- **Legal Compliance**: Ensure compliance with local laws regarding device modification
+- **Backup Data**: Always backup important data before proceeding
+- **No Support**: This is a research tool with limited support for recovery if things go wrong
+
+## Community & Support
+
+- **GitHub**: [amonet-kamakiri/kamakiri](https://github.com/amonet-kamakiri/kamakiri)
+- **Issues**: Report bugs and issues on GitHub
+- **XDA Developers**: Community discussions and support
+
+<Tip>
+  Before proceeding, thoroughly read the documentation and understand the risks involved. Having a good understanding of Android bootloaders and recovery systems will help you troubleshoot issues.
+</Tip>

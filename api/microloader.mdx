@@ -1,0 +1,560 @@
+---
+title: 'Microloader'
+description: 'Tiny loader injected into LK bootloader to load and execute the LK payload'
+icon: 'arrow-down-to-bracket'
+---
+
+## Overview
+
+The microloader is a minimal bootloader stub (< 512 bytes) that is permanently injected into the device's LK (Little Kernel) bootloader. Its sole purpose is to load the LK payload from the Boot0 partition and execute it on every boot, providing persistent exploit functionality.
+
+### Execution Context
+
+- **Injection Location**: Overwrites beginning of LK bootloader in eMMC
+- **Size**: < 512 bytes (fits in one sector)
+- **Execution**: Runs automatically during every boot
+- **Purpose**: Load and execute LK payload from Boot0 partition
+
+## Why Microloader?
+
+The microloader solves a critical problem in the exploit chain:
+
+1. **LK payload is too large** (~512 KB) to inject directly into LK bootloader
+2. **LK bootloader location** is read by preloader from eMMC
+3. **Microloader is tiny** (< 512 bytes) and can be injected into LK
+4. **Microloader loads large payload** from known location in Boot0
+
+### Boot Chain
+
+```
+Power On
+  |
+  v
+BROM Loads Preloader (from Boot0)
+  |
+  v
+Preloader Loads LK (from eMMC 'lk' partition)
+  |
+  v
+[Microloader Executes] <-- Injected here
+  |
+  v
+Microloader Reads Boot0 @ 0x80000
+  |
+  v
+Microloader Loads LK Payload to 0x41000000
+  |
+  v
+Microloader Jumps to LK Payload
+  |
+  v
+[LK Payload Executes]
+  |
+  v
+LK Payload Jumps to Original LK
+```
+
+## Implementation
+
+**Full Source** (microloader/main.c:31-58):
+```c
+int main() {
+
+    puts("microloader");
+
+    struct device_t *dev = (void*)get_device();
+
+    uint32_t *dst = (void*)PAYLOAD_DST;
+    size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+
+
+    if(*dst != 0xe3a0d442) {
+        puts("Try backup");
+        size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+    }
+
+    cache_clean(dst, PAYLOAD_SIZE);
+
+    // Jump to the payload
+    void (*jump)(void) = (void*)dst;
+    puts("Jump");
+    jump();
+
+    //puts("Something went horribly wrong!");
+
+    while (1) {
+
+    }
+}
+```
+
+## Memory Addresses
+
+**Constants** (common.h:18-25):
+```c
+#define PAYLOAD_DST  0x41000000  // LK payload load address
+#define PAYLOAD_SRC  0x80000     // Primary location in Boot0
+#define PAYLOAD_SIZE 0x80000     // 512 KB
+
+#define BOOT0_PART 1             // Boot0 partition ID
+#define USER_PART  8             // User partition ID
+
+#define BACKUP_SRC   0x200000    // Backup location in Boot0
+```
+
+### Memory Map
+
+| Address | Description |
+|---------|-------------|
+| 0x41000000 | LK payload load destination (PAYLOAD_DST) |
+| 0x41E00000 | Original LK base address (LK_BASE) |
+
+### Boot0 Partition Layout
+
+| Offset | Size | Content |
+|--------|------|----------|
+| 0x00000 | 512 KB | Preloader |
+| 0x80000 | 512 KB | LK Payload (primary) |
+| 0x200000 | 512 KB | LK Payload (backup) |
+
+## Load Process
+
+### Step 1: Get Device Handle
+
+```c
+struct device_t *dev = (void*)get_device();
+```
+
+Obtains the eMMC device structure from LK's environment. The `get_device()` function is provided by LK.
+
+**Device Structure** (common.h:3-10):
+```c
+struct device_t {
+    uint32_t unk1;
+    uint32_t unk2;
+    uint32_t unk3;
+    uint32_t unk4;
+    size_t (*read)(struct device_t *dev, uint64_t dev_addr, 
+                   void *dst, uint32_t size, uint32_t part);
+    size_t (*write)(struct device_t *dev, void *src, 
+                    uint64_t block_off, uint32_t size, uint32_t part);
+};
+```
+
+### Step 2: Load Primary Payload
+
+```c
+uint32_t *dst = (void*)PAYLOAD_DST;  // 0x41000000
+size_t ret = dev->read(dev, PAYLOAD_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+```
+
+**Parameters**:
+- `dev` - Device handle
+- `PAYLOAD_SRC` (0x80000) - Byte offset in Boot0
+- `dst` (0x41000000) - Load address in RAM
+- `PAYLOAD_SIZE` (0x80000 = 512 KB) - Size to read
+- `BOOT0_PART` (1) - Boot0 partition ID
+
+### Step 3: Validate Payload
+
+```c
+if(*dst != 0xe3a0d442) {
+    puts("Try backup");
+    size_t ret = dev->read(dev, BACKUP_SRC, dst, PAYLOAD_SIZE, BOOT0_PART);
+}
+```
+
+**Validation Magic**: `0xe3a0d442`
+
+This is the ARM instruction at the beginning of the LK payload:
+```asm
+e3a0d442    mov sp, #0x44200000
+```
+
+If the primary payload is corrupted (wrong magic), the microloader attempts to load from the backup location at 0x200000.
+
+<Note>
+The LK payload maintains its own backup copy during boot to ensure resilience.
+</Note>
+
+### Step 4: Clean Cache
+
+```c
+cache_clean(dst, PAYLOAD_SIZE);
+```
+
+Flushes the data cache to ensure all loaded bytes are written to RAM before execution. This is critical on ARM architectures with separate instruction and data caches.
+
+**Cache Clean Function** (common.h:13):
+```c
+void (*cache_clean)(void *addr, size_t sz) = (void*)0x41E231E4;
+```
+
+### Step 5: Jump to Payload
+
+```c
+void (*jump)(void) = (void*)dst;
+puts("Jump");
+jump();
+```
+
+Casts the load address to a function pointer and jumps to it, transferring execution to the LK payload.
+
+## UART Output
+
+The microloader provides minimal debug output:
+
+**UART Functions** (microloader/main.c:6-29):
+```c
+void low_uart_put(int ch) {
+    volatile uint32_t *uart_reg0 = (volatile uint32_t*)0x11003014;
+    volatile uint32_t *uart_reg1 = (volatile uint32_t*)0x11003000;
+
+    while ( !((*uart_reg0) & 0x20) )
+    {}
+
+    *uart_reg1 = ch;
+}
+
+int putchar(int character) {
+    if (character == '\n')
+        low_uart_put('\r');
+    low_uart_put(character);
+    return character;
+}
+
+int puts(const char *line) {
+    for (const char *c = line; *c; ++c) {
+        putchar(*c);
+    }
+    putchar('\n');
+    return 0;
+}
+```
+
+**Debug Messages**:
+```
+microloader
+Jump
+```
+
+Or if backup is used:
+```
+microloader
+Try backup
+Jump
+```
+
+**UART Registers**:
+- `0x11003000` - UART data register
+- `0x11003014` - UART status register (bit 5 = TX ready)
+
+## Injection Process
+
+The microloader must be injected into the LK partition in eMMC:
+
+### Using Stage 2 Payload
+
+```python
+import struct
+
+# Build microloader
+!cd microloader && make
+
+# Read microloader binary
+with open('microloader/build/microloader.bin', 'rb') as f:
+    microloader = f.read()
+
+print(f"Microloader size: {len(microloader)} bytes")
+assert len(microloader) <= 512, "Microloader too large!"
+
+# Switch to user partition
+stage2_switch_partition(0)
+
+# Find LK partition offset from GPT
+stage2_read_gpt()  # Returns g_lk offset
+
+# Read first block of LK
+lk_block = g_lk
+lk_header = stage2_read_block(lk_block)
+
+# Replace beginning with microloader
+injected = microloader + lk_header[len(microloader):]
+
+# Write back
+stage2_write_block(lk_block, injected)
+
+print("Microloader injected into LK!")
+```
+
+### Backup Original LK
+
+<Warning>
+Always backup the original LK partition before injection!
+</Warning>
+
+```python
+# Backup entire LK partition
+lk_size_blocks = 0x100000 // 512  # 1 MB
+with open('lk_backup.bin', 'wb') as f:
+    for i in range(lk_size_blocks):
+        block = stage2_read_block(g_lk + i)
+        f.write(block)
+
+print("LK backed up to lk_backup.bin")
+```
+
+## Size Constraints
+
+The microloader must be extremely small:
+
+**Maximum Size**: 512 bytes (one sector)
+
+**Why?**
+- LK header and data must remain intact
+- Only the beginning of LK can be overwritten
+- Larger code would corrupt essential LK structures
+
+**Current Size**: ~200 bytes (compiled with optimizations)
+
+**Build Flags**:
+```makefile
+CFLAGS = -Os -mthumb -mcpu=cortex-a7 -fno-builtin -nostdlib
+```
+
+- `-Os` - Optimize for size
+- `-mthumb` - Use Thumb instruction set (16-bit instructions)
+- `-fno-builtin` - Avoid standard library functions
+- `-nostdlib` - Don't link standard library
+
+## Error Handling
+
+### Primary Load Failure
+
+If the primary payload at 0x80000 is corrupted:
+1. Magic validation fails (`*dst != 0xe3a0d442`)
+2. Microloader prints "Try backup"
+3. Attempts load from backup at 0x200000
+
+### Backup Load Failure
+
+If backup also fails:
+1. Invalid code at 0x41000000
+2. Jump executes invalid instructions
+3. Device likely crashes or hangs
+
+**Recovery**: Re-exploit and re-flash LK payload via Stage 2
+
+### Infinite Loop
+
+The commented-out error message:
+```c
+//puts("Something went horribly wrong!");
+
+while (1) {
+    // Hang forever
+}
+```
+
+This code is never reached if jump succeeds. It exists as a safeguard if the function pointer somehow returns.
+
+## Fastboot Flag
+
+The microloader leaves a flag in memory for the LK payload:
+
+**Flag Location**: `0x41E0062C` (in LK memory space)
+
+**Usage in LK Payload** (lk-payload/main.c:109-114):
+```c
+// Need to read this before we restore the data
+uint8_t *tmp = (void*)0x41e0062c;
+
+// microloader
+if (strncmp(tmp, "FASTBOOT_PLEASE", 15) == 0 ) {
+    fastboot = 1;
+}
+```
+
+The microloader can write "FASTBOOT_PLEASE" to this location (though current version doesn't) to force fastboot mode. This provides an alternate mechanism to the MISC partition.
+
+## Memory Restoration
+
+After the LK payload executes, it must restore the memory overwritten by the microloader:
+
+**LK Payload Restoration** (lk-payload/main.c:118-121):
+```c
+// Restore the 0x41E00200-0x41E01200 range, overwritten by microloader
+dev->read(dev, g_lk * 0x200 + 0x200 + 0x200, 
+          (char*)LK_BASE + 0x200, 0x1000, USER_PART);
+```
+
+Reads the original LK code from the partition (before microloader injection) and restores it to RAM. The microloader's code is no longer needed after the LK payload is loaded.
+
+<Note>
+Do not restore 0x41E00000-0x41E00200 as it contains pointers set by preloader.
+</Note>
+
+## Building Microloader
+
+### Prerequisites
+
+```bash
+sudo apt-get install gcc-arm-none-eabi
+```
+
+### Build Commands
+
+```bash
+cd microloader
+make clean
+make
+```
+
+**Output**: `build/microloader.bin`
+
+### Makefile Snippet
+
+```makefile
+CROSS_COMPILE = arm-none-eabi-
+CC = $(CROSS_COMPILE)gcc
+OBJCOPY = $(CROSS_COMPILE)objcopy
+
+CFLAGS = -Os -mthumb -mcpu=cortex-a7 -fno-builtin -nostdlib -fPIC
+LDFLAGS = -T link.ld -nostdlib
+
+microloader.bin: microloader.elf
+	$(OBJCOPY) -O binary $< $@
+
+microloader.elf: main.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+main.o: main.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+```
+
+### Size Check
+
+```bash
+ls -lh build/microloader.bin
+arm-none-eabi-size build/microloader.elf
+```
+
+**Expected Output**:
+```
+-rw-r--r-- 1 user user 208 Mar 13 12:34 build/microloader.bin
+   text    data     bss     dec     hex filename
+    208       0       0     208      d0 build/microloader.elf
+```
+
+## Security Implications
+
+### Persistence
+
+The microloader provides **permanent** exploit persistence:
+- Executes on every boot
+- Survives reboots, power cycles, factory resets
+- Cannot be removed without re-flashing LK partition
+
+### Stealth
+
+- Extremely small footprint (< 512 bytes)
+- No visible indicators during normal boot
+- UART messages only visible with debug cable
+- Device functions normally after exploitation
+
+### Attack Surface
+
+- Attacker with physical access + exploit can inject microloader
+- Once injected, provides persistent backdoor
+- LK payload can be updated in Boot0 without re-exploiting
+- Allows arbitrary code execution in bootloader context
+
+## Limitations
+
+- **Size Constrained**: Must fit in < 512 bytes
+- **No Network**: Cannot load payload over network
+- **Fixed Location**: Payload must be at known offset in Boot0
+- **No Crypto**: No signature verification (intentional)
+- **Single Purpose**: Only loads and jumps to LK payload
+
+## Debug Tips
+
+### UART Monitoring
+
+Connect UART cable and monitor boot:
+```bash
+screen /dev/ttyUSB0 115200
+```
+
+**Expected Output**:
+```
+[...preloader output...]
+microloader
+Jump
+This is LK-payload for mantis by xyz and k4y0z. Copyright 2019
+[...LK payload output...]
+```
+
+### Missing "microloader" Message
+
+If "microloader" doesn't appear:
+- Microloader not properly injected into LK
+- LK partition corrupted
+- Preloader not loading LK from expected location
+
+### "Try backup" Message
+
+If "Try backup" appears:
+- Primary LK payload at 0x80000 is corrupted
+- Re-flash LK payload via Stage 2
+
+### Hang After "Jump"
+
+If device hangs after "Jump":
+- LK payload corrupted or invalid
+- Memory address mismatch
+- LK payload not properly linked for 0x41000000
+
+## Usage Example
+
+Complete injection workflow:
+
+```python
+# 1. Build microloader
+!make -C microloader clean all
+
+# 2. Build LK payload
+!make -C lk-payload clean all
+
+# 3. Exploit device and reach Stage 2
+exploit_device()
+wait_for_stage2()
+
+# 4. Backup original LK
+backup_lk_partition('lk_backup.bin')
+
+# 5. Install LK payload to Boot0
+install_lk_payload('lk-payload/build/payload.bin')
+
+# 6. Inject microloader into LK partition
+inject_microloader('microloader/build/microloader.bin')
+
+print("Installation complete!")
+print("Reboot device to activate persistent exploit.")
+
+# 7. Reboot
+stage2_reboot()
+```
+
+## Source Reference
+
+Full implementation:
+- `microloader/main.c` - Main microloader code
+- `lk-payload/common.h` - Shared definitions
+- `microloader/link.ld` - Linker script
+
+## Related
+
+- [LK Payload](/api/lk-payload) - The payload loaded by microloader
+- [Stage 2 Payload](/api/stage2-payload) - Used to install microloader
+- [Architecture](/advanced/architecture) - Complete boot chain analysis

@@ -1,0 +1,399 @@
+---
+title: 'Installation'
+description: 'Complete installation guide for building and preparing Kamakiri'
+---
+
+This guide covers the complete installation process for Kamakiri, from installing dependencies to building payloads and preparing binary assets.
+
+## Quick Start
+
+<Steps>
+  <Step title="Clone the Repository">
+    ```bash
+    git clone https://github.com/amonet-kamakiri/kamakiri.git
+    cd kamakiri
+    ```
+  </Step>
+  
+  <Step title="Install Dependencies">
+    ```bash
+    pip3 install -r requirements.txt
+    ```
+  </Step>
+  
+  <Step title="Build Payloads">
+    ```bash
+    cd brom-payload
+    make
+    cd ../lk-payload
+    make
+    cd ..
+    ```
+  </Step>
+  
+  <Step title="Prepare Binary Assets">
+    Download or prepare the required binary files in the `bin/` directory.
+  </Step>
+</Steps>
+
+## Detailed Installation
+
+### 1. Python Dependencies
+
+Kamakiri requires specific Python packages for USB/serial communication and data handling:
+
+<CodeGroup>
+```bash Install from requirements.txt
+pip3 install -r requirements.txt
+```
+
+```bash Manual Installation
+pip3 install future==0.17.1
+pip3 install iso8601==0.1.12
+pip3 install pyserial==3.4
+pip3 install pyusb==1.0.2
+pip3 install PyYAML==5.1.2
+```
+</CodeGroup>
+
+<Accordion title="Package Descriptions">
+  - **future**: Python 2/3 compatibility utilities
+  - **iso8601**: ISO 8601 date/time parsing
+  - **pyserial**: Serial port communication (for bootrom protocol)
+  - **pyusb**: USB device access (for USB control transfers)
+  - **PyYAML**: YAML parsing for configuration files
+</Accordion>
+
+Verify installation:
+
+```python Verification Script
+#!/usr/bin/env python3
+import serial
+import usb.core
+import yaml
+
+print("✓ All dependencies installed successfully")
+```
+
+### 2. Building Bootrom Payloads
+
+The bootrom exploit uses a three-stage payload architecture:
+
+<CardGroup cols={3}>
+  <Card title="Stage 1" icon="1">
+    Initial payload loaded into bootrom (max 0xA00 bytes)
+  </Card>
+  <Card title="Stage 2" icon="2">
+    Extended payload with full eMMC access
+  </Card>
+  <Card title="Preloader" icon="3">
+    Alternative entry point for devices in preloader mode
+  </Card>
+</CardGroup>
+
+#### Build Process
+
+```bash Build All Payloads
+cd brom-payload
+make clean
+make
+```
+
+This generates three binary files:
+
+- `stage1/stage1.bin` - Initial bootrom exploit payload
+- `stage2/stage2.bin` - Full featured payload (eMMC, RPMB, crypto)
+- `pl/pl.bin` - Preloader mode payload
+
+<Accordion title="Build Configuration Details">
+  The Makefile uses these compiler settings for ARM Cortex-A9:
+  
+  ```makefile
+  CC := arm-none-eabi-gcc
+  CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+            -fno-builtin-printf -fno-strict-aliasing \
+            -fno-builtin-memcpy -mno-unaligned-access
+  LDFLAGS := -nodefaultlibs -nostdlib -lgcc
+  ```
+  
+  **Stage 1** includes:
+  - `stage1.c` - Main exploit code
+  - `brom_common.c` - Bootrom interface
+  - `common.c` - Utility functions
+  
+  **Stage 2** adds:
+  - `payload_common.c` - eMMC and RPMB operations
+  - `drivers/sd.c`, `drivers/mmc.c` - Storage drivers
+  - `crypto/sha256.c`, `crypto/hmac-sha256.c` - Cryptographic functions
+  - `libc.c`, `printf.c` - Standard library functions
+</Accordion>
+
+#### Verify Build Output
+
+```bash
+ls -lh stage1/stage1.bin stage2/stage2.bin pl/pl.bin
+```
+
+Expected output:
+```
+-rw-r--r-- 1 user user  2.1K stage1/stage1.bin
+-rw-r--r-- 1 user user   18K stage2/stage2.bin
+-rw-r--r-- 1 user user   17K pl/pl.bin
+```
+
+<Warning>
+  Stage 1 payload must be less than 0xA00 (2560) bytes to fit in the bootrom buffer. The build will succeed, but the exploit will fail at runtime if this limit is exceeded.
+</Warning>
+
+### 3. Building LK Payload
+
+The Little Kernel (LK) payload provides persistent bootloader modifications:
+
+```bash Build LK Payload
+cd lk-payload
+make clean
+make
+```
+
+This generates `build/payload.bin` which is flashed to boot0 partition at offset 1024.
+
+<Accordion title="LK Payload Components">
+  ```makefile
+  C_SRC = main.c libc.c
+  ASM_SRC = start.S
+  CFLAGS := -std=gnu99 -Os -mthumb -mcpu=cortex-a9 \
+            -DPRINTF_DISABLE_SUPPORT_FLOAT=1
+  ```
+  
+  The payload is linked at a specific address and padded:
+  ```bash
+  dd if=/dev/zero bs=512 count=1 >>payload.bin
+  ```
+</Accordion>
+
+### 4. Required Binary Assets
+
+The exploit requires several pre-built binary files in the `bin/` directory:
+
+<CardGroup cols={2}>
+  <Card title="Bootloader Components" icon="microchip">
+    - `preloader.img` - MediaTek preloader
+    - `lk.bin` - Little Kernel bootloader
+    - `tz.img` - TrustZone image
+  </Card>
+  <Card title="Recovery & Tools" icon="screwdriver-wrench">
+    - `twrp.img` - TWRP recovery image
+    - `microloader.bin` - Boot injection loader
+    - `gpt-mantis.bin` - GPT partition table
+  </Card>
+</CardGroup>
+
+#### Binary Assets Structure
+
+```bash
+bin/
+├── preloader.img    # Flashed to boot0 partition (offset 0)
+├── lk.bin           # Flashed to 'lk' partition
+├── tz.img           # Flashed to 'tee1' partition
+├── twrp.img         # Flashed to 'recovery' partition
+├── microloader.bin  # Injected into 'boot' partition (2 blocks)
+└── gpt-mantis.bin   # GPT repair image (34 blocks)
+```
+
+<Note>
+  These binary files are device-specific and must match your exact device model. Using incorrect binaries can brick your device.
+</Note>
+
+### 5. Project Structure
+
+After building, your project should look like this:
+
+```
+kamakiri/
+├── bin/
+│   ├── preloader.img
+│   ├── lk.bin
+│   ├── tz.img
+│   ├── twrp.img
+│   ├── microloader.bin
+│   └── gpt-mantis.bin
+├── brom-payload/
+│   ├── stage1/
+│   │   └── stage1.bin
+│   ├── stage2/
+│   │   └── stage2.bin
+│   └── pl/
+│       └── pl.bin
+├── lk-payload/
+│   └── build/
+│       └── payload.bin
+├── modules/
+│   ├── main.py
+│   ├── common.py
+│   ├── load_payload.py
+│   ├── functions.py
+│   ├── logger.py
+│   └── handshake2.py
+├── bootrom-step.sh
+├── fastboot-step.sh
+├── boot-recovery.sh
+├── boot-fastboot.sh
+├── gpt-fix.sh
+└── requirements.txt
+```
+
+## Execution Scripts
+
+Kamakiri provides several shell scripts for different stages:
+
+<CodeGroup>
+```bash bootrom-step.sh
+#!/bin/bash
+set -e
+cd modules
+python3 main.py $@
+cd ..
+```
+
+```bash fastboot-step.sh
+#!/bin/bash
+set -e
+fastboot flash recovery bin/twrp.img
+fastboot oem reboot-recovery
+echo ""
+echo "Your device will now reboot into TWRP."
+echo ""
+```
+
+```bash gpt-fix.sh
+#!/bin/bash
+set -e
+cd modules
+python3 main.py fixgpt
+cd ..
+```
+</CodeGroup>
+
+### Script Descriptions
+
+<Accordion title="bootrom-step.sh">
+  Main exploit script that:
+  1. Waits for device in bootrom mode
+  2. Performs handshake with bootrom
+  3. Loads stage 1 and stage 2 payloads
+  4. Downgrades RPMB, TZ, and LK
+  5. Flashes microloader and preloader
+  6. Reboots to fastboot
+</Accordion>
+
+<Accordion title="fastboot-step.sh">
+  Post-exploit script that:
+  1. Flashes TWRP recovery image
+  2. Reboots device into recovery mode
+</Accordion>
+
+<Accordion title="gpt-fix.sh">
+  Repairs corrupted GPT partition table:
+  1. Runs exploit with `fixgpt` parameter
+  2. Flashes `gpt-mantis.bin` to first 34 blocks
+</Accordion>
+
+## Building Distribution Package
+
+The `makedist.sh` script creates a release package:
+
+```bash Create Distribution
+./makedist.sh
+```
+
+This creates:
+
+```
+dist/
+├── unlock/          # Full exploit package
+├── gptfix/          # GPT repair only
+└── full/            # Combined package
+```
+
+<Accordion title="Distribution Contents">
+  ```bash
+  dist/unlock/kamakiri/
+  ├── bin/
+  │   ├── preloader.img
+  │   ├── lk.bin
+  │   ├── tz.img
+  │   ├── twrp.img
+  │   └── microloader.bin
+  ├── lk-payload/build/
+  │   └── payload.bin
+  ├── modules/
+  │   └── *.py
+  ├── brom-payload/
+  │   ├── stage1/stage1.bin
+  │   ├── stage2/stage2.bin
+  │   └── pl/pl.bin
+  └── *.sh
+  ```
+</Accordion>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Build Errors: 'arm-none-eabi-gcc' not found">
+    Install the ARM cross-compiler toolchain:
+    ```bash
+    # Ubuntu/Debian
+    sudo apt-get install gcc-arm-none-eabi
+    
+    # macOS
+    brew install arm-none-eabi-gcc
+    ```
+  </Accordion>
+  
+  <Accordion title="Import Error: No module named 'serial'">
+    Install pyserial:
+    ```bash
+    pip3 install pyserial==3.4
+    ```
+  </Accordion>
+  
+  <Accordion title="Permission denied: '/dev/ttyUSB0'">
+    Add your user to the dialout group:
+    ```bash
+    sudo usermod -a -G dialout $USER
+    ```
+    Then log out and back in.
+  </Accordion>
+  
+  <Accordion title="Stage 1 payload too large">
+    The stage 1 payload must be < 0xA00 bytes. Check build output:
+    ```bash
+    ls -l brom-payload/stage1/stage1.bin
+    ```
+    If too large, review code for optimization opportunities.
+  </Accordion>
+  
+  <Accordion title="ModemManager interference">
+    Ensure ModemManager is fully stopped:
+    ```bash
+    sudo systemctl stop ModemManager
+    sudo systemctl disable ModemManager
+    ps aux | grep -i modemmanager
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart Guide" icon="play" href="/usage/quickstart">
+    Learn how to run the exploit
+  </Card>
+  <Card title="Understanding the Architecture" icon="book" href="/advanced/architecture">
+    Deep dive into the technical details
+  </Card>
+</CardGroup>
+
+<Check>
+  Installation complete! Your environment is ready to run Kamakiri.
+</Check>

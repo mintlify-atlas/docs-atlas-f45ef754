@@ -1,0 +1,1147 @@
+---
+title: Troubleshooting
+description: Common issues, error messages, and solutions for Kamakiri
+icon: 'wrench'
+---
+
+## Connection Issues
+
+### Device Not Found
+
+**Symptom:**
+```
+Waiting for device
+(hangs indefinitely)
+```
+
+**Causes and Solutions:**
+
+<AccordionGroup>
+
+<Accordion title="ModemManager Interference" icon="signal">
+ModemManager on Linux attempts to communicate with MediaTek devices and interferes with the exploit.
+
+**Detection:**
+```python
+# modules/functions.py:24-34
+def check_modemmanager():
+    pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+    
+    for pid in pids:
+        try:
+            args = open(os.path.join('/proc', pid, 'cmdline'), 'rb')
+                       .read().decode("utf-8").split('\0')
+            if len(args) > 0 and "modemmanager" in args[0].lower():
+                print("You need to temporarily disable/uninstall "
+                      "ModemManager before this script can proceed")
+                sys.exit(1)
+        except IOError:
+            continue
+```
+
+**Solution:**
+```bash
+# Temporarily disable
+sudo systemctl stop ModemManager
+
+# Or uninstall permanently
+sudo apt remove modemmanager
+```
+
+<Note>
+Kamakiri automatically checks for ModemManager when running `modules/main.py`.
+</Note>
+</Accordion>
+
+<Accordion title="Wrong USB Mode" icon="usb">
+The device must be in bootrom mode for the exploit to work.
+
+**Check USB ID:**
+```bash
+lsusb | grep MediaTek
+# Should show: 0e8d:0003 MediaTek Inc. MT65xx Preloader
+```
+
+**If showing different ID:**
+- Device is in preloader or fastboot mode, not bootrom
+- Reboot device and try entering bootrom mode again
+- Verify hardware shorts are correct
+
+**Bootrom Mode Detection:**
+```python
+# modules/common.py:74-99
+def find_device(self):
+    log("Waiting for device")
+    
+    old = serial_ports()
+    while True:
+        new = serial_ports()
+        
+        # port added
+        if new > old:
+            port = (new - old).pop()
+            break
+        # port removed
+        elif old > new:
+            old = new
+        
+        time.sleep(0.25)
+    
+    log("Found port = {}".format(port.device))
+    
+    # Check if in preloader instead of bootrom
+    if not PID in port.hwid:  # PID = "0003"
+        self.preloader = True
+```
+</Accordion>
+
+<Accordion title="Insufficient Permissions" icon="lock">
+Linux requires permissions to access serial devices.
+
+**Error:**
+```
+Permission denied: '/dev/ttyACM0'
+```
+
+**Solution:**
+```bash
+# Add user to dialout group
+sudo usermod -a -G dialout $USER
+
+# Log out and back in, or:
+newgrp dialout
+
+# Or run with sudo (not recommended)
+sudo python3 modules/main.py
+```
+</Accordion>
+
+<Accordion title="USB Cable Issues" icon="cable-car">
+**Symptoms:**
+- Device detected but immediately disconnects
+- Intermittent connection
+
+**Solutions:**
+- Use a high-quality USB data cable (not charge-only)
+- Connect directly to PC USB port, not through hub
+- Try different USB ports
+- Check for loose connections
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Exploit Execution Errors
+
+### Protocol Mismatch
+
+**Error Message:**
+```python
+RuntimeError: Serial protocol mismatch, expected 5f got XX
+```
+
+**Location:** `modules/common.py:101-103`
+
+```python
+def check(self, test, gold):
+    if test != gold:
+        raise RuntimeError("ERROR: Serial protocol mismatch, "
+                          "expected {} got {}".format(gold.hex(), test.hex()))
+```
+
+**Causes:**
+
+<Steps>
+
+<Step title="Wrong Bootrom Version">
+The exploit assumes specific bootrom function addresses:
+```c
+// brom-payload/brom_common.c:3-11
+void (*send_usb_response)(int, int, int) = (void*)0x55bb;
+int (*send_dword)() = (void*)0xBE09;
+int (*recv_dword)() = (void*)0xBDD5;
+int (*send_data)() = (void*)0xBED1;
+int (*recv_data)() = (void*)0xBE4B;
+```
+
+These addresses are for specific MediaTek SoCs (MT8163/MT8173).
+
+**Solution:** Verify your device uses a compatible SoC.
+</Step>
+
+<Step title="Device State Corruption">
+Device may be in unexpected state from previous exploit attempt.
+
+**Solution:** Hard reboot the device by removing and reapplying power.
+</Step>
+
+<Step title="USB Communication Error">
+USB packet corruption or timing issues.
+
+**Solution:**
+```python
+# Increase timeout
+BAUD = 115200
+TIMEOUT = 5  # Try increasing to 10
+
+# In modules/common.py:11-14
+BAUD = 115200
+TIMEOUT = 10  # Increased
+VID = "0E8D"
+PID = "0003"
+```
+</Step>
+
+</Steps>
+
+### Payload Too Large
+
+**Error:**
+```python
+RuntimeError: payload too large
+```
+
+**Location:** `modules/load_payload.py:35-36`
+
+```python
+if len(payload) >= 0xA00:
+    raise RuntimeError("payload too large")
+```
+
+**Explanation:**
+
+Stage 1 payload must fit within 2560 bytes (`0xA00`) due to bootrom memory constraints.
+
+**Solution:**
+
+Rebuild stage 1 with optimizations:
+```bash
+cd brom-payload/stage1/
+arm-none-eabi-gcc -mthumb -mcpu=cortex-a9 -Os -nostdlib \
+  -ffunction-sections -fdata-sections \
+  -Wl,--gc-sections \
+  -o stage1.elf stage1.c common.c brom_common.c \
+  -T linker.ld
+arm-none-eabi-objcopy -O binary stage1.elf stage1.bin
+ls -l stage1.bin  # Must be < 2560 bytes
+```
+
+### Stage 1 Not Responding
+
+**Error:**
+```python
+RuntimeError: received b'\x00\x00\x00\x00' instead of expected pattern
+```
+
+**Location:** `modules/load_payload.py:96-98`
+
+```python
+data = d.read(4)
+if data != b"\xA1\xA2\xA3\xA4":
+    raise RuntimeError("received {} instead of expected pattern".format(data))
+```
+
+**Diagnosis:**
+
+Stage 1 failed to execute or crashed during initialization.
+
+**Common Causes:**
+
+<AccordionGroup>
+
+<Accordion title="USB Response Not Sent">
+Stage 1 must call `send_usb_response()` to prevent USB timeout:
+
+```c
+// brom-payload/stage1.c:19-21
+// This is so we don't get a USB-Timeout
+print("Send USB response\n");
+send_usb_response(0,0,1);
+```
+
+If this is missing or fails, the bootrom USB stack times out and crashes.
+</Accordion>
+
+<Accordion title="Watchdog Timeout">
+Watchdog timer not disabled or kicked in time.
+
+**Check in stage 1:**
+```c
+case 0x3001: {  // Kick watchdog
+    volatile uint32_t *reg = (volatile uint32_t *)0x10007000;
+    reg[8/4] = 0x1971;
+    break;
+}
+```
+
+**Python side must kick watchdog:**
+```python
+# modules/load_payload.py:63-66
+while not thread.done:
+    dev.write32(0x10007008, 0x1971)  # low-level watchdog kick
+    time.sleep(1)
+```
+</Accordion>
+
+<Accordion title="Memory Corruption">
+Stage 1 loaded to wrong address or corrupted during transfer.
+
+**Verify load address:**
+```python
+# modules/load_payload.py:27-38
+def attempt2(d):
+    d.write(b"\xE0")
+    result = d.read(1)
+    d.write(p32(0xA00))  # Size to allocate
+    result = d.read(4)
+    
+    payload = load_payload_file("../brom-payload/stage1/stage1.bin")
+    
+    if len(payload) >= 0xA00:
+        raise RuntimeError("payload too large")
+    
+    d.write(payload)  # Transferred here
+```
+</Accordion>
+
+</AccordionGroup>
+
+**Debug with UART:**
+
+Connect UART to see stage 1 output:
+```c
+// brom-payload/stage1.c:16-17
+print("Entered 1ST stage payload\n");
+print("Copyright xyz, k4y0z 2019\n");
+```
+
+UART settings: 115200 baud, 8N1, no flow control
+
+---
+
+## Stage 2 Issues
+
+### Stage 2 Load Failure
+
+**Error:**
+```python
+RuntimeError: device failure
+```
+
+**Location:** `modules/load_payload.py:119-121`
+
+```python
+code = d.read(4)
+if code != b"\xd0\xd0\xd0\xd0":
+    raise RuntimeError("device failure")
+```
+
+**Causes:**
+
+1. **Stage 1 write command failed:**
+```c
+// brom-payload/stage1.c:40-47
+if(recv_data(address, size, 0) == 0) {
+    print("OK\n");
+    send_dword(0xD0D0D0D0);
+} else {
+    send_dword(0xF0F0F0F0);  // Failure
+    print("Read fail\n");
+}
+```
+
+2. **Invalid target address (0x201000)**
+
+3. **Stage 2 binary corrupted**
+
+**Solution:**
+```bash
+# Rebuild stage 2
+cd brom-payload/stage2/
+make clean
+make
+
+# Verify binary
+file stage2.bin
+ls -lh stage2.bin
+```
+
+### Stage 2 Not Responding
+
+**Error:**
+```python
+RuntimeError: received b'\x00\x00\x00\x00' instead of expected pattern
+```
+
+**Location:** `modules/load_payload.py:135-137`
+
+```python
+data = d.read(4)
+if data != b"\xB1\xB2\xB3\xB4":  # Stage 2 ready signal
+    raise RuntimeError("received {} instead of expected pattern".format(data))
+```
+
+**Debug Steps:**
+
+<Steps>
+
+<Step title="Check Stage 2 Entry Point">
+```c
+// brom-payload/stage2.c:4-6
+int main() {
+    printf("Entered 2ND stage payload\n");
+    printf("Copyright xyz, k4y0z 2019\n");
+```
+
+Connect UART to verify these messages appear.
+</Step>
+
+<Step title="Check MMC Initialization">
+```c
+// brom-payload/stage2.c:8-11
+struct msdc_host host = { 0 };
+host.ocr_avail = MSDC_OCR_AVAIL;
+
+mmc_init(&host);
+```
+
+MMC init should print diagnostic messages:
+```
+MSDC_CFG: 0x10010011
+GO_IDLE = 0x00000000
+SEND_OP_COND = 0x00000000 ocr = 0x40FF8080
+...
+```
+</Step>
+
+<Step title="Verify Command Loop Entry">
+```c
+// brom-payload/payload_common.c:47-49
+printf("Entering command loop\n");
+send_dword(0xB1B2B3B4);
+```
+
+This signal indicates stage 2 is ready.
+</Step>
+
+</Steps>
+
+---
+
+## eMMC Operation Errors
+
+### Read/Write Errors
+
+**Error in UART:**
+```
+Read block 0x00000000
+Read error!
+```
+
+**Location:** `brom-payload/payload_common.c:65-67`
+
+```c
+if (mmc_read(host, block, buf) != 0) {
+    printf("Read error!\n");
+}
+```
+
+**Causes:**
+
+<AccordionGroup>
+
+<Accordion title="Wrong Partition Selected">
+Attempting to read beyond partition size.
+
+**Example:**
+```python
+dev.emmc_switch(1)  # Boot0 partition (typically 4MB)
+dev.emmc_read(0x10000)  # Trying to read block beyond partition
+```
+
+**Solution:**
+```python
+# Check partition size first
+switch_boot0(dev)
+# Boot0 is typically 0x2000 blocks (4MB)
+# Valid range: 0 to 0x1FFF
+```
+</Accordion>
+
+<Accordion title="eMMC Not Initialized">
+MMC controller not properly initialized.
+
+**Check initialization sequence:**
+```c
+// brom-payload/drivers/mmc.c:998-1039
+int mmc_init(struct msdc_host *host) {
+    // ... initialization ...
+    ret = mmc_go_idle(host);
+    printf("GO_IDLE = 0x%08X\n", ret);
+    // Should print 0x00000000
+```
+
+If `GO_IDLE` returns error, eMMC is not responding.
+</Accordion>
+
+<Accordion title="Hardware eMMC Failure">
+Physical eMMC chip failure or corruption.
+
+**Symptoms:**
+- All reads return 0x00 or 0xFF
+- Write commands succeed but reads show no change
+- Inconsistent behavior
+
+**Solution:** Device may require hardware repair or eMMC replacement.
+</Accordion>
+
+</AccordionGroup>
+
+### Partition Switch Failure
+
+**Error:**
+```python
+RuntimeError: what's wrong with your BOOT0?
+```
+
+**Location:** `modules/functions.py:36-42`
+
+```python
+def switch_boot0(dev):
+    dev.emmc_switch(1)
+    block = dev.emmc_read(0)
+    if block[0:9] != b"EMMC_BOOT" and block != b"\x00" * 0x200:
+        dev.reboot()
+        raise RuntimeError("what's wrong with your BOOT0?")
+    dev.kick_watchdog()
+```
+
+**Diagnosis:**
+
+Boot0 partition doesn't have expected signature.
+
+**Possible Causes:**
+
+1. **Partition corrupted from previous exploit attempt**
+2. **Device uses different boot partition format**
+3. **eMMC hardware issue**
+
+**Recovery:**
+```python
+# Try reading anyway
+dev.emmc_switch(1)
+try:
+    data = dev.emmc_read(0)
+    print("Boot0 first 512 bytes:")
+    print(data.hex())
+except:
+    print("Cannot read boot0")
+
+# Try boot1 instead
+dev.emmc_switch(2)
+data = dev.emmc_read(0)
+```
+
+### GPT Corruption
+
+**Error:**
+```python
+RuntimeError: bad gpt
+```
+
+**Location:** `modules/main.py:50-51`
+
+```python
+if "lk" not in gpt or "tee1" not in gpt or "boot" not in gpt or "recovery" not in gpt:
+    raise RuntimeError("bad gpt")
+```
+
+**Diagnosis:**
+
+Required partitions not found in GPT.
+
+**Recovery:**
+
+<Steps>
+
+<Step title="Dump Current GPT">
+```python
+dev.emmc_switch(0)
+gpt = parse_gpt(dev)
+print("Found partitions:", list(gpt.keys()))
+```
+</Step>
+
+<Step title="Check GPT Header">
+```python
+gpt_header = dev.emmc_read(1)
+if gpt_header[0:8] != b'EFI PART':
+    print("GPT header corrupted!")
+    # Need to restore GPT
+```
+</Step>
+
+<Step title="Restore GPT (if available)">
+```python
+# If you have a backup GPT for your device
+dev.emmc_switch(0)
+flash_binary(dev, "gpt-backup.bin", 0, 34 * 0x200)
+
+# Or use fixgpt mode
+# python3 modules/main.py fixgpt
+```
+</Step>
+
+</Steps>
+
+---
+
+## RPMB Issues
+
+### RPMB Read Failure
+
+**Error:**
+```python
+RuntimeError: read fail
+```
+
+**Symptoms:**
+- RPMB returns all zeros
+- RPMB returns error codes
+
+**RPMB Result Codes:**
+
+| Code | Meaning |
+|------|----------|
+| 0x0000 | Success |
+| 0x0001 | General failure |
+| 0x0002 | Authentication failure |
+| 0x0003 | Counter failure |
+| 0x0004 | Address failure |
+| 0x0005 | Write failure |
+| 0x0006 | Read failure |
+| 0x0007 | Authentication key not yet programmed |
+
+**Check Result:**
+```c
+// brom-payload/drivers/mmc.c:776-778
+mmc_rpmb_post_frame(&rpmb_req);
+printf("result = %d\n", result);
+```
+
+**Common Issues:**
+
+<AccordionGroup>
+
+<Accordion title="RPMB Key Derivation Failed">
+Key derived from CID is incorrect.
+
+**Debug:**
+```c
+// brom-payload/drivers/mmc.c:1024-1030
+uint32_t cid[4] = { 0 };
+ret = mmc_all_send_cid(host, cid);
+printf("ALL_SEND_CID = 0x%08X cid = 0x%08X 0x%08X 0x%08X 0x%08X\n", 
+       ret, cid[0], cid[1], cid[2], cid[3]);
+
+uint32_t cid_be[4] = { 0 };
+for (int i = 0; i < 4; ++i)
+    cid_be[i] = __builtin_bswap32(cid[i]);
+derive_rpmb_key((void*)cid_be);
+```
+
+Verify CID is read correctly.
+</Accordion>
+
+<Accordion title="SEJ Encryption Failed">
+Hardware crypto engine (SEJ) malfunction.
+
+**Check SEJ initialization:**
+```c
+// brom-payload/drivers/mmc.c:785-841
+static void sej_init(int arg) {
+    // ... SEJ register initialization ...
+    sdr_write32(0x1000A040, 0x9ED40400);
+    sdr_write32(0x1000A044, 0xE884A1);
+    // etc.
+}
+```
+
+These magic values are device-specific.
+</Accordion>
+
+<Accordion title="RPMB Counter Mismatch">
+Write counter out of sync.
+
+**Solution:**
+RPMB counter is monotonically increasing. Once incremented, it cannot be decreased without clearing RPMB (which is the goal of the exploit).
+</Accordion>
+
+</AccordionGroup>
+
+### RPMB Write Failure
+
+**Error:**
+```python
+RuntimeError: downgrade failure, giving up
+```
+
+**Location:** `modules/main.py:68-74`
+
+```python
+log("Downgrade rpmb")
+dev.rpmb_write(b"\x00" * 0x100)
+log("Recheck rpmb")
+rpmb = dev.rpmb_read()
+if rpmb != b"\x00" * 0x100:
+    dev.reboot()
+    raise RuntimeError("downgrade failure, giving up")
+```
+
+**Diagnosis:**
+
+RPMB write succeeded but verification shows different data.
+
+**Possible Causes:**
+
+1. **HMAC-SHA256 MAC calculation incorrect**
+```c
+// brom-payload/drivers/mmc.c:891-909
+void rpmb_calc_mac(struct mmc_core_rpmb_req *rpmb_req) {
+    hmac_sha256(req->mac, 
+                rpmb_req->frame + RPMB_DATA_BEG,
+                512 - RPMB_DATA_BEG,
+                rpmb_key,
+                sizeof(rpmb_key));
+}
+```
+
+2. **RPMB key wrong**
+
+3. **eMMC refusing write due to authentication failure**
+
+**Debug:**
+
+Enable debug output in RPMB functions:
+```c
+// brom-payload/drivers/mmc.c:893-902
+printf("hmac over \n");
+hex_dump(rpmb_req->frame + RPMB_DATA_BEG, 512 - RPMB_DATA_BEG);
+
+printf("using key \n");
+hex_dump(rpmb_key, sizeof(rpmb_key));
+
+printf("results in \n");
+hex_dump(req->mac, 32);
+```
+
+---
+
+## Firmware Flash Issues
+
+### Preloader Flash Failure
+
+**Error:**
+Device boots into bootrom mode even after exploit completes.
+
+**Cause:**
+
+Preloader not written correctly to boot0 partition offset 0.
+
+**Verification:**
+```python
+dev.emmc_switch(1)  # Boot0
+preloader = dev.emmc_read(0)
+
+# Check for preloader signature
+if preloader[0:4] == b"MMM\x01":
+    print("Preloader header found")
+else:
+    print("Preloader missing or corrupted")
+```
+
+**Reflash:**
+```python
+switch_boot0(dev)
+flash_binary(dev, "../bin/preloader.img", 0)
+
+# Verify
+preloader_check = dev.emmc_read(0)
+original = open("../bin/preloader.img", "rb").read(512)
+if preloader_check == original:
+    print("Preloader flash successful")
+```
+
+### LK Flash Failure
+
+**Symptom:**
+
+Device boots but hangs at LK or doesn't reach Android.
+
+**Check LK partition:**
+```python
+switch_user(dev)
+gpt = parse_gpt(dev)
+lk_start, lk_size = gpt["lk"]
+
+# Read LK
+lk_data = dev.emmc_read(lk_start)
+
+# Check for LK signature
+if lk_data[0:4] == b"\x88\x16\x88\x58":  # MediaTek header
+    print("LK header found")
+```
+
+### Microloader Injection Issues
+
+**Symptom:**
+
+Device boots but LK payload doesn't execute.
+
+**Diagnosis:**
+
+<Steps>
+
+<Step title="Check Microloader in Boot Partition">
+```python
+switch_user(dev)
+gpt = parse_gpt(dev)
+boot_start, boot_size = gpt["boot"]
+
+# Read first 0x400 bytes
+boot_header = dev.emmc_read(boot_start) + dev.emmc_read(boot_start + 1)
+
+print("First 16 bytes:")
+print(boot_header[0:16].hex())
+
+# Should NOT be "ANDROID!" (that's at offset 0x400 now)
+if boot_header[0:8] == b"ANDROID!":
+    print("ERROR: Microloader not injected!")
+```
+</Step>
+
+<Step title="Verify Android Header Moved">
+```python
+# Check offset 0x400
+boot_header2 = dev.emmc_read(boot_start + 2) + dev.emmc_read(boot_start + 3)
+
+if boot_header2[0:8] == b"ANDROID!":
+    print("Android header correctly moved to +0x400")
+else:
+    print("ERROR: Android header missing!")
+```
+</Step>
+
+<Step title="Check LK Payload in Boot0">
+```python
+switch_boot0(dev)
+
+# LK payload at block 1024
+lk_payload_start = dev.emmc_read(1024)
+
+# Should start with ARM instruction (0xe3a0d442 = mov sp, #...)
+if struct.unpack("<I", lk_payload_start[0:4])[0] == 0xe3a0d442:
+    print("LK payload found at boot0:1024")
+else:
+    print("ERROR: LK payload missing!")
+```
+</Step>
+
+</Steps>
+
+**Reinstall:**
+```python
+# modules/main.py:88-100
+log("Flash lk-payload")
+switch_boot0(dev)
+flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+
+log("Inject microloader")
+switch_user(dev)
+boot_hdr1 = dev.emmc_read(gpt["boot"][0]) + dev.emmc_read(gpt["boot"][0] + 1)
+boot_hdr2 = dev.emmc_read(gpt["boot"][0] + 2) + dev.emmc_read(gpt["boot"][0] + 3)
+flash_binary(dev, "../bin/microloader.bin", gpt["boot"][0], 2 * 0x200)
+if boot_hdr2[0:8] != b"ANDROID!":
+    flash_data(dev, boot_hdr1, gpt["boot"][0] + 2, 2 * 0x200)
+```
+
+---
+
+## Runtime Issues
+
+### Watchdog Reset
+
+**Symptom:**
+
+Device suddenly reboots during long operations.
+
+**Cause:**
+
+Watchdog timer not kicked within ~4 seconds.
+
+**Solution:**
+
+Always kick watchdog in loops:
+
+```python
+# modules/functions.py:56-61
+for x in range(blocks):
+    print("[{} / {}]".format(x + 1, blocks), end='\r')
+    dev.emmc_write(start_block + x, data[x * 0x200:(x + 1) * 0x200])
+    if x % 10 == 0:
+        dev.kick_watchdog()  # Kick every 10 blocks
+```
+
+**Manual kick:**
+```python
+dev.kick_watchdog()
+# or directly:
+dev.dev.write(struct.pack('>I', 0xf00dd00d))
+dev.dev.write(struct.pack('>I', 0x3001))
+```
+
+### Device Hangs
+
+**Symptom:**
+
+Device stops responding, no UART output, LED frozen.
+
+**Likely Causes:**
+
+1. **Invalid memory access** - Payload accessed invalid address and CPU exception
+2. **Stack overflow** - Payload stack exceeded available space
+3. **USB disconnect** - Physical USB connection lost
+
+**Recovery:**
+
+<Steps>
+
+<Step title="Hard Reset">
+Remove and reapply power to device. For devices with non-removable batteries, hold power button for 15+ seconds.
+</Step>
+
+<Step title="Check USB Connection">
+```bash
+lsusb | grep MediaTek
+dmesg | tail -20
+```
+
+Look for USB disconnect/reconnect messages.
+</Step>
+
+<Step title="Verify Device State">
+Reconnect device in bootrom mode and start from beginning.
+</Step>
+
+</Steps>
+
+### Memory Corruption
+
+**Symptom:**
+
+Exploit completes but device doesn't boot properly, or boots with corrupted graphics/random behavior.
+
+**Causes:**
+
+1. **LK memory not restored after microloader**
+```c
+// lk-payload/main.c:118-121
+// MUST restore this range
+dev->read(dev, g_lk * 0x200 + 0x200 + 0x200, 
+          (char*)LK_BASE + 0x200, 0x1000, USER_PART);
+```
+
+2. **Cache not cleaned before execution**
+```c
+// microloader/main.c:46
+cache_clean(dst, PAYLOAD_SIZE);
+```
+
+3. **Wrong partition written**
+
+**Recovery:**
+
+Reflash all components:
+```python
+dev.emmc_switch(0)
+flash_binary(dev, "../bin/lk.bin", gpt["lk"][0], gpt["lk"][1] * 0x200)
+
+switch_boot0(dev)
+flash_binary(dev, "../lk-payload/build/payload.bin", 1024)
+
+switch_user(dev)
+# Re-inject microloader
+# ...
+```
+
+---
+
+## Diagnostic Tools
+
+### UART Debugging
+
+**Hardware Setup:**
+
+1. Connect USB-to-UART adapter to device UART pins
+2. GND, TX (device) to RX (adapter), RX (device) to TX (adapter)
+3. 3.3V logic levels
+
+**Software:**
+```bash
+# Linux
+sudo minicom -D /dev/ttyUSB0 -b 115200
+
+# Or screen
+sudo screen /dev/ttyUSB0 115200
+
+# Or Python
+import serial
+uart = serial.Serial('/dev/ttyUSB0', 115200)
+while True:
+    print(uart.read(uart.in_waiting or 1).decode('utf-8', errors='ignore'), end='')
+```
+
+**Expected Output:**
+
+**Stage 1:**
+```
+Entered 1ST stage payload
+Copyright xyz, k4y0z 2019
+Send USB response
+Entering command loop
+```
+
+**Stage 2:**
+```
+Entered 2ND stage payload
+Copyright xyz, k4y0z 2019
+MSDC_CFG: 0x10010011
+GO_IDLE = 0x00000000
+SEND_OP_COND = 0x00000000 ocr = 0x40FF8080
+new ocr = 0x40FF8080
+SEND_OP_COND = 0x00000000 ocr = 0xC0FF8080
+ALL_SEND_CID = 0x00000000 cid = ...
+SET_RELATIVE_ADDR = 0x00000000
+SELECT_CARD = 0x00000000
+Entering command loop
+```
+
+### Memory Dumps
+
+**Dump Bootrom:**
+```python
+bootrom = dev.mem_read(0x00000000, 0x20000)
+with open("bootrom_dump.bin", "wb") as f:
+    f.write(bootrom)
+
+print("Bootrom dumped: {} bytes".format(len(bootrom)))
+```
+
+**Dump SRAM:**
+```python
+sram = dev.mem_read(0x00100000, 0x20000)
+with open("sram_dump.bin", "wb") as f:
+    f.write(sram)
+```
+
+**Dump All Partitions:**
+```python
+switch_user(dev)
+gpt = parse_gpt(dev)
+
+for name, (start, size) in gpt.items():
+    print(f"Dumping {name}...")
+    dump_binary(dev, f"{name}.img", start, size * 0x200)
+```
+
+### Verify Exploit State
+
+```python
+def verify_exploit_state(dev):
+    """Check if exploit is fully installed"""
+    
+    print("Checking RPMB...")
+    rpmb = dev.rpmb_read()
+    if rpmb == b"\x00" * 0x100:
+        print("✓ RPMB zeroed")
+    else:
+        print("✗ RPMB not zeroed")
+        return False
+    
+    print("\nChecking boot0...")
+    switch_boot0(dev)
+    preloader = dev.emmc_read(0)
+    if preloader[0:4] != b"\x00\x00\x00\x00":
+        print("✓ Preloader present")
+    else:
+        print("✗ Preloader missing")
+        return False
+    
+    lk_payload = dev.emmc_read(1024)
+    if struct.unpack("<I", lk_payload[0:4])[0] == 0xe3a0d442:
+        print("✓ LK payload present")
+    else:
+        print("✗ LK payload missing")
+        return False
+    
+    print("\nChecking boot partition...")
+    switch_user(dev)
+    gpt = parse_gpt(dev)
+    boot_start, _ = gpt["boot"]
+    boot_hdr = dev.emmc_read(boot_start)
+    if boot_hdr[0:8] != b"ANDROID!":
+        print("✓ Microloader injected")
+    else:
+        print("✗ Microloader not injected")
+        return False
+    
+    print("\n✓ All checks passed!")
+    return True
+```
+
+---
+
+## Getting Help
+
+<Card title="Report Issues" icon="github" href="https://github.com/amonet-kamakiri/kamakiri">
+  Report bugs and issues on GitHub
+</Card>
+
+**When reporting issues, include:**
+
+1. Device model and hardware revision
+2. Complete error message and traceback
+3. UART output (if available)
+4. Output of `lsusb -v -d 0e8d:0003`
+5. Steps to reproduce
+6. OS and Python version
+
+**Information to collect:**
+
+```bash
+# System info
+uname -a
+python3 --version
+lsusb
+dmesg | tail -50
+
+# Device info (once connected)
+python3 -c "from modules.common import Device; \
+            dev = Device(); \
+            dev.find_device(); \
+            from modules.load_payload import load_payload; \
+            load_payload(dev); \
+            print(dev.idme_read(b'device_type_id'))"
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/advanced/architecture">
+    Understand the exploit architecture
+  </Card>
+  <Card title="Payload Stages" icon="layer-group" href="/advanced/payload-stages">
+    Detailed payload information
+  </Card>
+</CardGroup>
