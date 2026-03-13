@@ -1,0 +1,103 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Kamakiri",
+  "projectDescription": "A bootrom exploit tool for MediaTek devices enabling bootloader unlock and custom recovery installation",
+  "theme": "aspen",
+  "primaryColor": "#DC2626",
+  "lightColor": "#EF4444",
+  "darkColor": "#991B1B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "prerequisites",
+              "installation"
+            ]
+          },
+          {
+            "group": "Usage Guide",
+            "pages": [
+              "usage/quickstart",
+              "usage/bootrom-exploit",
+              "usage/fastboot-mode",
+              "usage/recovery-mode"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/architecture",
+              "advanced/payload-stages",
+              "advanced/emmc-operations",
+              "advanced/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": [
+              "api/device",
+              "api/payload-loader",
+              "api/functions"
+            ]
+          },
+          {
+            "group": "Shell Scripts",
+            "pages": [
+              "api/bootrom-step",
+              "api/fastboot-step",
+              "api/boot-scripts"
+            ]
+          },
+          {
+            "group": "Payloads",
+            "pages": [
+              "api/stage1-payload",
+              "api/stage2-payload",
+              "api/lk-payload",
+              "api/microloader"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "MediaTek bootrom exploit implementation",
+    "Multi-stage payload injection (stage1, stage2, preloader)",
+    "eMMC read/write operations via serial protocol",
+    "RPMB downgrade for bootloader unlock",
+    "Custom recovery (TWRP) installation",
+    "Fastboot mode access without hardware buttons",
+    "GPT partition table manipulation",
+    "Device communication via USB serial interface"
+  ],
+  "publicApiSurface": [
+    "bootrom-step.sh - Main exploit execution script",
+    "boot-fastboot.sh - Boot device into fastboot mode",
+    "boot-recovery.sh - Boot device into recovery mode",
+    "Device class - Serial communication with MediaTek bootrom",
+    "Device.handshake() - Bootrom handshake protocol",
+    "Device.read32() - Read 32-bit words from device memory",
+    "Device.write32() - Write 32-bit words to device memory",
+    "Device.emmc_read() - Read eMMC blocks",
+    "Device.emmc_write() - Write eMMC blocks",
+    "Device.rpmb_read() - Read RPMB data",
+    "Device.rpmb_write() - Write RPMB data",
+    "Device.reboot() - Reboot device",
+    "load_payload() - Load and execute bootrom payload",
+    "load_pl_payload() - Load preloader payload",
+    "flash_binary() - Flash binary file to eMMC",
+    "parse_gpt() - Parse GPT partition table",
+    "force_fastboot() - Set device to boot into fastboot"
+  ]
+}
